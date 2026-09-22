@@ -375,19 +375,22 @@ export function setWinner(state, matchId, side) {
  * Compute the champion, if any.
  * Returns { name } or null.
  */
+// Returns { name, runnerUp } once the tournament is decided, else null.
 export function champion(state) {
   const m = state.matches;
+  const decided = (match) => {
+    const win = match.winner === 'p1' ? match.p1 : match.p2;
+    const lose = match.winner === 'p1' ? match.p2 : match.p1;
+    if (!isPlayer(win)) return null;
+    return { name: win.name, runnerUp: isPlayer(lose) ? lose.name : null };
+  };
   const gf2 = m['GF-2'];
-  if (gf2 && gf2.winner && gf2.winner !== 'bye') {
-    const ref = gf2.winner === 'p1' ? gf2.p1 : gf2.p2;
-    if (isPlayer(ref)) return { name: ref.name };
-  }
+  if (gf2 && gf2.winner && gf2.winner !== 'bye') return decided(gf2);
   const gf1 = m['GF-1'];
   if (gf1 && gf1.winner && gf1.winner !== 'bye') {
     // If reset is enabled and LB entrant won GF-1, GF-2 decides it (not done yet).
     if (state.resetBracket && m['GF-2'] && gf1.winner === 'p2') return null;
-    const ref = gf1.winner === 'p1' ? gf1.p1 : gf1.p2;
-    if (isPlayer(ref)) return { name: ref.name };
+    return decided(gf1);
   }
   return null;
 }

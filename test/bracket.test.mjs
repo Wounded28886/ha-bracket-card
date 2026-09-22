@@ -114,6 +114,7 @@ section('full playthrough, favourite wins (n=8)');
   });
   const champ = champion(s);
   assert(champ && champ.name === 'S1', `champion is S1 (got ${champ && champ.name})`);
+  assert(champ && champ.runnerUp === 'S2', `runner-up is S2 (got ${champ && champ.runnerUp})`);
   // Favourite never lost, so no bracket reset should be needed (GF-1 p1 wins).
   assert(s.matches['GF-1'].winner === 'p1', 'GF-1 won by WB entrant');
   assert(!s.matches['GF-2'].winner, 'GF-2 not played');
@@ -137,6 +138,9 @@ section('grand-final bracket reset (n=4)');
   s = setWinner(s, 'GF-2', 'p1');
   const champ = champion(s);
   assert(champ != null, 'champion decided after GF-2');
+  const gf2Names = [gf2.p1.name, gf2.p2.name];
+  assert(champ.name === gf2.p1.name && champ.runnerUp === gf2.p2.name,
+    `champion/runner-up come from GF-2 (${gf2Names} -> ${champ.name}/${champ.runnerUp})`);
 }
 
 // ---- reset disabled: GF-1 decides outright ----
