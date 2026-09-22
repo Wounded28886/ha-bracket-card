@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Bracket</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🏆</text></svg>">
+<style>
+  /*
+   * The cards are written for Home Assistant, so they style themselves from
+   * HA's CSS custom properties. Defining the same names here is all it takes
+   * for them to look at home outside it.
+   */
+  :root {
+    color-scheme: light dark;
+    --primary-color: #03a9f4;
+    --accent-color: #ff9800;
+    --success-color: #43a047;
+    --error-color: #db4437;
+    --warning-color: #ffa600;
+    --primary-text-color: #212121;
+    --secondary-text-color: #727272;
+    --disabled-text-color: #bdbdbd;
+    --text-primary-color: #ffffff;
+    --divider-color: #e0e0e0;
+    --card-background-color: #ffffff;
+    --secondary-background-color: #f1f3f5;
+    --page-background: #f6f7f9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --primary-text-color: #e1e1e1;
+      --secondary-text-color: #9b9b9b;
+      --disabled-text-color: #6f6f6f;
+      --divider-color: #4c4c4c;
+      --card-background-color: #1c1c1c;
+      --secondary-background-color: #2a2a2a;
+      --page-background: #111213;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--page-background);
+    color: var(--primary-text-color);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  #cards { width: 100%; max-width: 1100px; display: flex; flex-direction: column; gap: 16px; }
+  /* `ha-card` is Home Assistant's own wrapper element; here it is just a box. */
+  ha-card {
+    display: block;
+    background: var(--card-background-color);
+    border-radius: 14px;
+    border: 1px solid var(--divider-color);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+    overflow: hidden;
+  }
+  #status {
+    display: none;
+    width: 100%;
+    max-width: 1100px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    background: var(--warning-color);
+    color: #222;
+    font-size: .92rem;
+  }
+  #boot { color: var(--secondary-text-color); }
+</style>
+</head>
+<body>
+  <div id="status"></div>
+  <div id="cards"><p id="boot">Loading…</p></div>
+  <script type="module">
+    import './ha-bracket-card.js';
+    document.getElementById('boot')?.remove();
+  </script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

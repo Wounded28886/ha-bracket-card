@@ -1,8 +1,14 @@
 # Bracket Card for Home Assistant
 
-A reusable **game-night tournament card** you drive from a Lovelace dashboard.
-Pick a format, type in the players, tap the winner of each match, and the card
-keeps score. One button starts a fresh tournament next time.
+A reusable **game-night tournament board**. Pick a format, type in the players,
+tap the winner of each match, and it keeps score. One button starts a fresh
+tournament next time.
+
+Run it either way — the board itself is the same code in both:
+
+- **In Home Assistant** as a Lovelace card, installed through HACS.
+- **On its own** as a Docker container (a NAS, a Pi, anything), with no Home
+  Assistant at all — see [Standalone (Docker)](#standalone-docker).
 
 ![Preview](docs/preview.png)
 
@@ -16,8 +22,8 @@ keeps score. One button starts a fresh tournament next time.
   later rounds centred between their feeders, and the grand final on the right.
 - **Reusable** — nothing is hard-coded. New game night = new bracket in seconds.
 - **No custom integration, no Python** — a single frontend card. State lives in
-  one `input_text` helper, so it survives restarts and is shared across every
-  device looking at the dashboard.
+  one `input_text` helper (or, standalone, one JSON file), so it survives
+  restarts and is shared across every device looking at it.
 - **Tap to advance / re-pick** — mis-tapped? Tap the other name; anything
   downstream that depended on it is cleared automatically.
 - **Game name** — type what you're playing (Mario Kart, UNO…) when you set up
@@ -280,6 +286,94 @@ fit, either use shorter display names, run fewer players, or point `entity` at a
 
 ---
 
+## Standalone (Docker)
+
+The cards ask Home Assistant for exactly three things: the text entity holding
+the tournament, and the two `rest_command`s that write and read results. The
+standalone server provides those three itself, so **the same card bundle runs
+unmodified** — every format, the history, the ongoing king-of-the-hill titles —
+with no Home Assistant anywhere.
+
+Everything lives in one file, `/data/store.json`: the tournament in progress
+and every recorded result. One container, one volume, no database.
+
+### Run it
+
+```yaml
+services:
+  bracket:
+    build: https://github.com/Wounded28886/ha-bracket-card.git
+    container_name: bracket
+    restart: unless-stopped
+    ports: ["8099:8099"]
+    volumes: ["./data:/data"]
+    environment:
+      TITLE: "Game Night"
+```
+
+**On a Synology NAS:** Container Manager → Project → Create, paste that compose
+file, pick a folder for the project, and start it. Then open
+`http://<nas-ip>:8099`. The `./data` folder next to the project holds
+`store.json` — include it in Hyper Backup and you've backed up every result.
+
+Each release also publishes a prebuilt multi-arch image, if you'd rather pull
+than build:
+
+```bash
+docker run -d --name bracket -p 8099:8099 -v /volume1/docker/bracket:/data \
+  -e TITLE="Game Night" --restart unless-stopped \
+  ghcr.io/wounded28886/ha-bracket-card:latest
+```
+
+### Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT` | `8099` | Port inside the container |
+| `DATA_DIR` | `/data` | Where `store.json` lives — mount this |
+| `TITLE` | `Game Night` | Heading on the page |
+| `BOARD` | `default` | Board used when the URL doesn't name one |
+| `POLL_MS` | `25000` | How long a sync request may wait |
+
+Every device pointed at the URL stays in step: a tap on one phone shows up on
+the others (and the TV, and the fridge) in about a second, without refreshing.
+
+**Several boards at once** — add `?board=` to the URL: `…:8099/?board=kids`
+runs a second, independent tournament alongside the default one. `?title=`
+overrides the heading for that link.
+
+> **There is no login.** Keep it on your LAN, or put it behind a reverse proxy
+> that handles authentication if you want it reachable from outside.
+
+### API
+
+The page is only a client; anything can drive it:
+
+```bash
+curl -s localhost:8099/api/state                       # current tournament
+curl -s localhost:8099/api/query --json '{"q":"SELECT \"winner\",\"game\" FROM \"result\" ORDER BY time DESC LIMIT 5"}'
+curl -s localhost:8099/api/query --json '{"q":"DELETE FROM \"result\""}'   # clear the history
+curl -s localhost:8099/healthz
+```
+
+Results are stored and queried exactly as they are under Home Assistant
+(InfluxDB line protocol in, a subset of InfluxQL out), which is why the same
+cards work against both. To **bring your Home Assistant history across**, read
+it out of InfluxDB and post the lines over:
+
+```bash
+curl -sG "http://<ha-ip>:8086/query?db=game_night&epoch=s" -u game_night \
+     --data-urlencode 'q=SELECT * FROM "result"' > results.json
+# then replay each row as a line-protocol point against /api/write
+```
+
+### Development
+
+```bash
+npm run serve     # http://localhost:8099, data in ./data
+npm test          # includes the server's own tests
+```
+
 ## Development
 
 ```bash
@@ -291,9 +385,13 @@ npm run build     # bundle src/ -> dist/ha-bracket-card.js
   in `test/bracket.test.mjs`.
 - `src/formats.js` — round robin, Swiss, king of the hill, free-for-all logic.
   Unit-tested in `test/formats.test.mjs`.
-- `src/card.js` — the Lovelace custom element.
+- `src/card.js` — the Lovelace custom elements (both cards).
 - `dist/ha-bracket-card.js` — the bundled file HACS serves. **Generated** — run
   `npm run build` after editing `src/`.
+- `server/` — the standalone server: `lib/influx.mjs` is the storage engine
+  (line protocol + the InfluxQL subset the cards use, tested in
+  `test/server.test.mjs`), `public/app.js` is the Home Assistant shim that lets
+  the unmodified cards run against it.
 
 ## License
 

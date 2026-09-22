@@ -40,7 +40,7 @@ import {
   kothChallengerCode, KOTH_MAX_PLAYERS, kothSnapshot, kothRebase,
 } from './formats.js';
 
-const CARD_VERSION = '1.5.0';
+const CARD_VERSION = '1.6.0';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.

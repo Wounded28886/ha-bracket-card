@@ -1,0 +1,23 @@
+# Standalone bracket server for a NAS or any Docker host.
+#
+#   docker compose up -d      ->  http://<host>:8099
+#
+# Everything lives in ./data/store.json: the tournament in progress and every
+# recorded result. Back that file up and you have backed up the lot.
+services:
+  bracket:
+    build: .
+    # Or, without a checkout, build straight from GitHub:
+    # build: https://github.com/Wounded28886/ha-bracket-card.git
+    image: ha-bracket-card:latest
+    container_name: bracket
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    volumes:
+      - ./data:/data
+    environment:
+      TITLE: "Game Night"
+      # BOARD: default      # board used when the URL doesn't name one
+      # PORT: 8099
+      # POLL_MS: 25000      # how long a sync request may wait
