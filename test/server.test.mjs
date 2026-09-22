@@ -193,9 +193,12 @@ section('http api');
 
   // Static files, including the card bundle from dist/.
   const page = await fetch(base + '/');
-  ok(page.status === 200 && (await page.text()).includes('bracket-card'), 'serves the page');
-  const bundle = await fetch(base + '/ha-bracket-card.js');
-  ok(bundle.status === 200 && (await bundle.text()).includes("customElements.define('bracket-card'"), 'serves the card bundle');
+  const html = await page.text();
+  ok(page.status === 200 && html.includes('./board.js') && html.includes('./app.js'), 'serves the page');
+  ok(!/home\s*assistant|hacs|input_text/i.test(html), 'the page carries no Home Assistant branding');
+  const bundle = await fetch(base + '/board.js');
+  ok(bundle.status === 200 && (await bundle.text()).includes("customElements.define('bracket-card'"), 'serves the board bundle under its own name');
+  ok((await fetch(base + '/ha-bracket-card.js')).status === 404, 'nothing is served under the Home Assistant name');
   ok((await fetch(base + '/api/nope')).status === 404, '404 for unknown paths');
   const escape = await fetch(base + '/../package.json');
   ok(escape.status === 404 || escape.status === 400, 'no climbing out of the static root');

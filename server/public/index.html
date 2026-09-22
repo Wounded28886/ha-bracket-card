@@ -8,9 +8,8 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🏆</text></svg>">
 <style>
   /*
-   * The cards are written for Home Assistant, so they style themselves from
-   * HA's CSS custom properties. Defining the same names here is all it takes
-   * for them to look at home outside it.
+   * The board takes every colour from these custom properties, so the whole
+   * look of it — light and dark — is set here and nowhere else.
    */
   :root {
     color-scheme: light dark;
@@ -52,7 +51,7 @@
     gap: 16px;
   }
   #cards { width: 100%; max-width: 1100px; display: flex; flex-direction: column; gap: 16px; }
-  /* `ha-card` is Home Assistant's own wrapper element; here it is just a box. */
+  /* Each card wraps itself in this element; here it is simply a panel. */
   ha-card {
     display: block;
     background: var(--card-background-color);
@@ -78,7 +77,7 @@
   <div id="status"></div>
   <div id="cards"><p id="boot">Loading…</p></div>
   <script type="module">
-    import './ha-bracket-card.js';
+    import './board.js';
     document.getElementById('boot')?.remove();
   </script>
   <script type="module" src="./app.js"></script>

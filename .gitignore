@@ -4,7 +4,7 @@ package-lock.json
 .DS_Store
 
 # Built into the image / copied for local `npm run serve`
-server/public/ha-bracket-card.js
+server/public/board.js
 
 # Standalone server data when run from a checkout
 data/

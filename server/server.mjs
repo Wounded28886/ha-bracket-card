@@ -31,9 +31,14 @@ const MAX_BODY = 1024 * 1024;
 
 const store = new Store(DATA_DIR);
 
-// The card bundle lives in dist/ in the repo and next to the page in the
-// image; look in both so `node server/server.mjs` works from a checkout.
-const STATIC_ROOTS = [join(HERE, 'public'), join(HERE, '..', 'dist')];
+// The page asks for /board.js. In the image that file sits next to the page;
+// from a checkout it's the bundle in dist/. Serving it under a name of its
+// own keeps the deployment free of Home Assistant's naming.
+const STATIC_ROOTS = [join(HERE, 'public')];
+const BUNDLE_CANDIDATES = [
+  join(HERE, 'public', 'board.js'),
+  join(HERE, '..', 'dist', 'ha-bracket-card.js'),
+];
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -132,6 +137,18 @@ const server = createServer(async (req, res) => {
       const out = store.query(q);
       const failed = out.results.find((r) => r.error);
       return json(res, failed ? 400 : 200, out);
+    }
+
+    if (path === '/board.js' && req.method === 'GET') {
+      for (const file of BUNDLE_CANDIDATES) {
+        try {
+          const body = await readFile(file);
+          res.writeHead(200, { 'content-type': TYPES['.js'], 'cache-control': 'max-age=60' });
+          res.end(body);
+          return;
+        } catch (e) { /* try the next one */ }
+      }
+      return json(res, 500, { error: 'board.js is missing — run `node build.mjs`' });
     }
 
     if (req.method === 'GET' && await serveStatic(path, res)) return;

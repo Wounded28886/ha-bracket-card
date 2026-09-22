@@ -1,15 +1,16 @@
-# Standalone bracket server for a NAS or any Docker host.
+# Tournament board — a self-contained server. Nothing else is required: no
+# Home Assistant, no database, no broker, no internet once it's built.
 #
-#   docker compose up -d      ->  http://<host>:8099
+#   docker compose up -d        ->  http://<host>:8099
 #
 # Everything lives in ./data/store.json: the tournament in progress and every
 # recorded result. Back that file up and you have backed up the lot.
 services:
   bracket:
+    # Builds from the files next to this compose file. See server/README.md
+    # for the Synology Container Manager walkthrough.
     build: .
-    # Or, without a checkout, build straight from GitHub:
-    # build: https://github.com/Wounded28886/ha-bracket-card.git
-    image: ha-bracket-card:latest
+    image: bracket-board:latest
     container_name: bracket
     restart: unless-stopped
     ports:
@@ -19,5 +20,5 @@ services:
     environment:
       TITLE: "Game Night"
       # BOARD: default      # board used when the URL doesn't name one
-      # PORT: 8099
+      # PORT: 8099          # port inside the container
       # POLL_MS: 25000      # how long a sync request may wait

@@ -13,7 +13,7 @@ COPY server ./server
 # someone forgot to rebuild, and serve it next to the page.
 RUN mkdir -p dist \
  && node build.mjs \
- && cp dist/ha-bracket-card.js server/public/ha-bracket-card.js \
+ && cp dist/ha-bracket-card.js server/public/board.js \
  && rm -rf dist
 
 ENV NODE_ENV=production \

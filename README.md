@@ -288,80 +288,27 @@ fit, either use shorter display names, run fewer players, or point `entity` at a
 
 ## Standalone (Docker)
 
-The cards ask Home Assistant for exactly three things: the text entity holding
-the tournament, and the two `rest_command`s that write and read results. The
-standalone server provides those three itself, so **the same card bundle runs
-unmodified** — every format, the history, the ongoing king-of-the-hill titles —
-with no Home Assistant anywhere.
-
-Everything lives in one file, `/data/store.json`: the tournament in progress
-and every recorded result. One container, one volume, no database.
-
-### Run it
-
-```yaml
-services:
-  bracket:
-    build: https://github.com/Wounded28886/ha-bracket-card.git
-    container_name: bracket
-    restart: unless-stopped
-    ports: ["8099:8099"]
-    volumes: ["./data:/data"]
-    environment:
-      TITLE: "Game Night"
-```
-
-**On a Synology NAS:** Container Manager → Project → Create, paste that compose
-file, pick a folder for the project, and start it. Then open
-`http://<nas-ip>:8099`. The `./data` folder next to the project holds
-`store.json` — include it in Hyper Backup and you've backed up every result.
-
-The build takes a minute or two on a NAS; after that it starts instantly.
-`docker compose pull && docker compose up -d --build` picks up a new version.
-
-### Settings
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PORT` | `8099` | Port inside the container |
-| `DATA_DIR` | `/data` | Where `store.json` lives — mount this |
-| `TITLE` | `Game Night` | Heading on the page |
-| `BOARD` | `default` | Board used when the URL doesn't name one |
-| `POLL_MS` | `25000` | How long a sync request may wait |
-
-Every device pointed at the URL stays in step: a tap on one phone shows up on
-the others (and the TV, and the fridge) in about a second, without refreshing.
-
-**Several boards at once** — add `?board=` to the URL: `…:8099/?board=kids`
-runs a second, independent tournament alongside the default one. `?title=`
-overrides the heading for that link.
-
-> **There is no login.** Keep it on your LAN, or put it behind a reverse proxy
-> that handles authentication if you want it reachable from outside.
-
-### API
-
-The page is only a client; anything can drive it:
+The board also runs **completely on its own** — a single container on a NAS or
+any Docker host, with its own address and its own storage. No Home Assistant,
+no database, no helpers, no `rest_command`s; once built it needs no internet
+either. Every format, the result history and the ongoing king-of-the-hill
+titles work exactly the same.
 
 ```bash
-curl -s localhost:8099/api/state                       # current tournament
-curl -s localhost:8099/api/query --json '{"q":"SELECT \"winner\",\"game\" FROM \"result\" ORDER BY time DESC LIMIT 5"}'
-curl -s localhost:8099/api/query --json '{"q":"DELETE FROM \"result\""}'   # clear the history
-curl -s localhost:8099/healthz
+docker compose up -d      # -> http://<host>:8099
 ```
 
-Results are stored and queried exactly as they are under Home Assistant
-(InfluxDB line protocol in, a subset of InfluxQL out), which is why the same
-cards work against both. To **bring your Home Assistant history across**, read
-it out of InfluxDB and post the lines over:
+**[server/README.md](server/README.md) is the whole story for that deployment** —
+a Synology Container Manager walkthrough, the settings, the API and how to back
+it up. It doesn't mention Home Assistant, because the deployment doesn't
+involve it.
 
-```bash
-curl -sG "http://<ha-ip>:8086/query?db=game_night&epoch=s" -u game_night \
-     --data-urlencode 'q=SELECT * FROM "result"' > results.json
-# then replay each row as a line-protocol point against /api/write
-```
+Under the hood it is the *same card bundle*, byte for byte: the cards only ever
+ask their host for a text entity and two service calls, so the standalone
+server provides those three things and they run unchanged. One codebase, one
+set of tests, two ways to run it.
 
-### Development
+## Development
 
 ```bash
 npm run serve     # http://localhost:8099, data in ./data
@@ -382,10 +329,10 @@ npm run build     # bundle src/ -> dist/ha-bracket-card.js
 - `src/card.js` — the Lovelace custom elements (both cards).
 - `dist/ha-bracket-card.js` — the bundled file HACS serves. **Generated** — run
   `npm run build` after editing `src/`.
-- `server/` — the standalone server: `lib/influx.mjs` is the storage engine
-  (line protocol + the InfluxQL subset the cards use, tested in
-  `test/server.test.mjs`), `public/app.js` is the Home Assistant shim that lets
-  the unmodified cards run against it.
+- `server/` — the standalone server (see [server/README.md](server/README.md)):
+  `lib/influx.mjs` is the storage engine (line protocol + the InfluxQL subset
+  the cards use, tested in `test/server.test.mjs`), `public/app.js` is the shim
+  that stands in for Home Assistant so the unmodified cards run against it.
 
 ## License
 
