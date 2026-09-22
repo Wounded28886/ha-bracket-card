@@ -316,14 +316,8 @@ file, pick a folder for the project, and start it. Then open
 `http://<nas-ip>:8099`. The `./data` folder next to the project holds
 `store.json` — include it in Hyper Backup and you've backed up every result.
 
-Each release also publishes a prebuilt multi-arch image, if you'd rather pull
-than build:
-
-```bash
-docker run -d --name bracket -p 8099:8099 -v /volume1/docker/bracket:/data \
-  -e TITLE="Game Night" --restart unless-stopped \
-  ghcr.io/wounded28886/ha-bracket-card:latest
-```
+The build takes a minute or two on a NAS; after that it starts instantly.
+`docker compose pull && docker compose up -d --build` picks up a new version.
 
 ### Settings
 
