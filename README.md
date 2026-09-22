@@ -1,14 +1,14 @@
 # Bracket Card for Home Assistant
 
-A reusable **double-elimination tournament bracket** you drive from a Lovelace
-dashboard — built for home game nights. Type in the players, tap the winner of
-each match, and the bracket advances itself. One button starts a fresh bracket
-next time.
+A reusable **game-night tournament card** you drive from a Lovelace dashboard.
+Pick a format, type in the players, tap the winner of each match, and the card
+keeps score. One button starts a fresh tournament next time.
 
 ![Preview](docs/preview.png)
 
-- **Double elimination** — a losers bracket gives everyone a second chance, with
-  an optional grand-final "bracket reset" game.
+- **Six formats** — double elimination (with the grand-final "bracket reset"),
+  single elimination, round robin, Swiss system, king of the hill and
+  free-for-all (points race). See [Formats](#formats).
 - **Any number of players (2–64)** — as many real first-round matches as
   possible; only the leftover player (if any) gets a bye.
 - **Random draw** — the entered names are shuffled when the bracket is created.
@@ -85,12 +85,29 @@ title: Friday Game Night
 
 ### 3. Play
 
-1. Enter the game you're playing, then the player names one per line, and hit
-   **Create bracket**. The draw is randomised, so the order you type them in
-   doesn't matter.
-2. Tap the winner of each match — the bracket fills the next rounds in as you go.
+1. Enter the game you're playing, choose a **Format**, type the player names one
+   per line, and hit **Start**. The draw is randomised, so the order you type
+   them in doesn't matter.
+2. Tap the winner of each match — the card fills in what comes next.
 3. When it's done, the 🏆 champion banner appears.
-4. **New bracket** clears it for the next game.
+4. **New game** clears it for the next one.
+
+---
+
+## Formats
+
+| Format | How it plays | Champion |
+| --- | --- | --- |
+| **Double elimination** | Lose twice and you're out. Winners bracket, losers bracket, grand final on the right, with a reset game if the losers-bracket player wins game 1 (`reset_bracket: false` to skip that). Byes are kept to a minimum: 5 players → 2 first-round matches and 1 bye. | Grand final winner |
+| **Single elimination** | Lose once and you're out. Fastest. | Final winner |
+| **Round robin** | Everyone plays everyone once; rounds are laid out as columns next to a live standings table. Odd counts sit one player out per round. | Most wins, then head-to-head. A dead tie gets a single-elimination **decider** among the tied players. |
+| **Swiss system** | A fixed number of rounds (default log₂ of the players, or set it on the setup screen). Each round pairs players on the same record, avoiding rematches; the next round only appears once the current one is done. Odd counts give the lowest-ranked player a bye (counts as a win). | Most wins, then head-to-head, then strength of opposition (SOS). Dead ties get a decider. |
+| **King of the hill** | Winner stays on. Player 1 starts as 👑 king against player 2; the loser goes to the back of the queue. Tap the winner of each game; **Undo** takes one back, **Finish session** ends it. The stat that matters is **wins on top** — games won while holding the hill — and that's what gets recorded. | Most wins on top (ties: whoever holds the hill) |
+| **Free-for-all** | Everyone plays at once — a Mario Kart race, a hand of UNO. Each round, tap the players in finishing order and **Save round**; points default to *n* … 1 for 1st … last (`ffa_points` to override, e.g. `[10, 7, 5, 3, 2, 1]`); anyone not placed scores 0. **Finish** ends it. | Most points, then most 1sts. If the top is tied, Finish waits for one more round. |
+
+Every format records the same things when tracking is on: the game, format,
+winner, runner-up, **every player who took part**, and a standings summary
+(W–L, points, or wins on top).
 
 ---
 
@@ -101,8 +118,10 @@ title: Friday Game Night
 | `type`          | string  | —                    | `custom:bracket-card` (required)                                   |
 | `entity`        | string  | —                    | An `input_text` (or `text`) helper that stores the bracket (required) |
 | `title`         | string  | `Tournament Bracket` | Heading shown on the card                                          |
-| `reset_bracket` | boolean | `true`               | If `true`, the grand final is best-of-two when the losers-bracket player wins game 1 (a true double-elim "bracket reset"). Set `false` for a single decisive grand final. |
+| `reset_bracket` | boolean | `true`               | Double elimination: if `true`, the grand final is best-of-two when the losers-bracket player wins game 1 (a true "bracket reset"). Set `false` for a single decisive grand final. |
 | `default_game`  | string  | —                    | Pre-fills the Game box on the setup screen                          |
+| `default_mode`  | string  | `double`             | Pre-selects the format: `double`, `single`, `round_robin`, `swiss`, `king_of_the_hill` or `free_for_all` |
+| `ffa_points`    | list    | *n* … 1              | Free-for-all points per finishing place                             |
 | `tracking`      | boolean / object | `false`     | Record results in InfluxDB — see [Result tracking](#result-tracking-influxdb) |
 
 ---
@@ -110,9 +129,9 @@ title: Friday Game Night
 ## Result tracking (InfluxDB)
 
 With tracking on, the card writes one point to InfluxDB the moment a champion is
-decided (game, winner, runner-up, players), and the **Bracket History Card**
-reads them back to show the current champion, every past winner and a wins
-leaderboard, filterable by game.
+decided (game, format, winner, runner-up, players, standings), and the **Bracket
+History Card** reads them back to show the current champion, every past winner
+and a wins leaderboard, filterable by game.
 
 A dashboard card can't talk to InfluxDB directly, so both directions go through
 two small `rest_command`s in Home Assistant. One-time setup:
@@ -195,14 +214,25 @@ tracking:
 
 ### What gets stored
 
-Measurement `result` (configurable), tag `game`, fields `winner`, `runner_up`,
-`players` (comma-separated), `player_count`; the point's timestamp is when the
-bracket was created. That means correcting a mis-tap after the champion was
-decided re-records over the same point rather than adding a duplicate. Because
-it's plain InfluxDB data, Grafana can chart it too: query
-`SELECT "winner", "runner_up", "game" FROM "result"` as a table and use a
-*Group by* transform on `winner`, or count one player at a time with
-`SELECT count("winner") FROM "result" WHERE "winner" = 'Eve'`. (Winner is a
+Measurement `result` (configurable) with:
+
+| | Name | Example |
+| --- | --- | --- |
+| tag | `game` | `Mario Kart` |
+| tag | `mode` | `double_elimination`, `single_elimination`, `round_robin`, `swiss`, `king_of_the_hill`, `free_for_all` |
+| field | `winner` | `Dad` |
+| field | `runner_up` | `Mum` |
+| field | `players` | `Mum, Dad, Atlas, Miles` — everyone who took part |
+| field | `player_count` | `4` |
+| field | `standings` | `Dad=3-1, Mum=2-2, …` (round robin / Swiss W–L), `Dad=21, Mum=17` (free-for-all points), `Dad=5, Mum=2` (king of the hill wins on top). Absent for brackets. |
+| field | `top_wins` | King of the hill only: the champion's wins while holding the hill |
+
+The point's timestamp is when the tournament was started. That means correcting
+a mis-tap after the champion was decided re-records over the same point rather
+than adding a duplicate. Because it's plain InfluxDB data, Grafana can chart it
+too: query `SELECT "winner", "runner_up", "game", "mode" FROM "result"` as a
+table and use a *Group by* transform on `winner`, or count one player at a time
+with `SELECT count("winner") FROM "result" WHERE "winner" = 'Eve'`. (Winner is a
 field rather than a tag so that a corrected result overwrites the original.)
 
 If a write fails (InfluxDB down, wrong password…) the champion banner says so
@@ -214,10 +244,12 @@ recorded yet.
 ## How state is stored (and the 255-character note)
 
 The card never stores the whole bracket tree. It stores only the player list,
-the game name and which side won each match, as a compact JSON string in the
-helper — the full graph is regenerated deterministically from that. This keeps
-the payload small: **8 players fit comfortably** inside an `input_text` (max 255
-chars).
+the game name, the format and the decisions (one character per match, or the
+finishing order per free-for-all round), as a compact JSON string in the helper
+— everything else is regenerated deterministically from that. This keeps the
+payload small: **8 players fit comfortably** inside an `input_text` (max 255
+chars). A long king-of-the-hill or free-for-all session (dozens of games) can
+also get there; the card tells you if it won't fit.
 
 For **large brackets with long names** (roughly 16+ players) the payload can
 approach the 255-character `input_text` limit. If the card warns you it won't
@@ -233,8 +265,10 @@ npm test          # logic unit tests + jsdom card smoke test
 npm run build     # bundle src/ -> dist/ha-bracket-card.js
 ```
 
-- `src/bracket.js` — pure double-elimination engine (no DOM). Unit-tested in
-  `test/bracket.test.mjs`.
+- `src/bracket.js` — pure double/single-elimination engine (no DOM). Unit-tested
+  in `test/bracket.test.mjs`.
+- `src/formats.js` — round robin, Swiss, king of the hill, free-for-all logic.
+  Unit-tested in `test/formats.test.mjs`.
 - `src/card.js` — the Lovelace custom element.
 - `dist/ha-bracket-card.js` — the bundled file HACS serves. **Generated** — run
   `npm run build` after editing `src/`.

@@ -82,7 +82,8 @@ function generateBracket(players, opts = {}) {
   }
   const size = nextPow2(names.length);
   const W = wbRounds(size);
-  const resetBracket = opts.resetBracket !== false;
+  const single = opts.single === true;
+  const resetBracket = !single && opts.resetBracket !== false;
 
   const matches = {};
   const order = [];
@@ -120,6 +121,14 @@ function generateBracket(players, opts = {}) {
     wb[r - 1].forEach((id, i) => {
       const target = wb[r][Math.floor(i / 2)];
       matches[id].winnerTo = { match: target, slot: i % 2 === 0 ? 'p1' : 'p2' };
+    });
+  }
+
+  // Single elimination: the winners bracket is the whole tournament.
+  if (single) {
+    return resolve({
+      version: 2, createdAt: new Date().toISOString(), size,
+      single: true, resetBracket: false, players: names, matches, order,
     });
   }
 
@@ -219,6 +228,7 @@ function generateBracket(players, opts = {}) {
     version: 2,
     createdAt: new Date().toISOString(),
     size,
+    single: false,
     resetBracket,
     players: names,
     matches,
@@ -385,6 +395,10 @@ function champion(state) {
     if (!isPlayer(win)) return null;
     return { name: win.name, runnerUp: isPlayer(lose) ? lose.name : null };
   };
+  if (state.single) {
+    const final = m[`W${Math.log2(state.size)}-1`];
+    return final && final.winner && final.winner !== 'bye' ? decided(final) : null;
+  }
   const gf2 = m['GF-2'];
   if (gf2 && gf2.winner && gf2.winner !== 'bye') return decided(gf2);
   const gf1 = m['GF-1'];
@@ -405,18 +419,307 @@ function slotLabel(ref) {
 }
 
 /*
- * ha-bracket-card — a reusable double-elimination bracket for Home Assistant.
+ * ha-bracket-card — non-bracket tournament formats
+ *
+ * Pure, dependency-free logic for round robin, Swiss, king of the hill and
+ * free-for-all. Like bracket.js, every format is rebuilt deterministically
+ * from the player list plus a compact decisions string, so the card only
+ * persists the decisions. Unit-tested in test/formats.test.mjs.
+ *
+ * Common result shape (what the card renders):
+ *   {
+ *     players: [names],
+ *     standings: [{ idx, name, ...stats }],   // ranked, best first
+ *     complete: bool,                         // nothing left to play (rr/swiss)
+ *     tie: [names] | null,                    // unresolved tie at the top
+ *     champion: { name, runnerUp } | null,
+ *     ... format-specific fields
+ *   }
+ */
+
+const cmpName = (a, b) => a.name.localeCompare(b.name);
+
+/* ======================= paired formats (rr / swiss) ======================= */
+
+// Circle-method round robin schedule. Returns rounds of [a, b] index pairs;
+// a bye is [a, null] (odd player counts).
+function roundRobinSchedule(n) {
+  const ids = Array.from({ length: n }, (_, i) => i);
+  if (n % 2 === 1) ids.push(null);
+  const size = ids.length;
+  const rounds = [];
+  for (let r = 0; r < size - 1; r++) {
+    const pairs = [];
+    for (let i = 0; i < size / 2; i++) {
+      const a = ids[i], b = ids[size - 1 - i];
+      // Alternate who is "home" so nobody is always listed first.
+      pairs.push(r % 2 === 0 ? [a, b] : [b, a]);
+    }
+    rounds.push(pairs.map(([a, b]) => (a == null ? [b, null] : [a, b])));
+    // rotate all but the first
+    ids.splice(1, 0, ids.pop());
+  }
+  return rounds;
+}
+
+function decode(w, i) {
+  const c = typeof w === 'string' ? w[i] : undefined;
+  return c === '1' ? 'p1' : c === '2' ? 'p2' : null;
+}
+
+function emptyStats(players) {
+  return players.map((name, idx) => ({ idx, name, wins: 0, losses: 0, played: 0, opponents: [], beat: new Set() }));
+}
+
+// Rank by wins, then by head-to-head record inside each tied group, then
+// (Swiss) by strength of opposition, then name. Returns {standings, tie}
+// where tie lists the names still level at the top after all tiebreaks.
+function rank(stats, useBuchholz) {
+  const rows = stats.map((s) => ({ ...s }));
+  if (useBuchholz) {
+    for (const r of rows) r.buchholz = r.opponents.reduce((acc, o) => acc + stats[o].wins, 0);
+  }
+  const h2h = (group) => {
+    // wins against other members of the group
+    for (const r of group) r.h2h = group.reduce((acc, o) => acc + (r.beat.has(o.idx) ? 1 : 0), 0);
+  };
+  const key = (r) => `${r.wins}|${r.h2h ?? ''}|${useBuchholz ? r.buchholz : ''}`;
+  // First pass: split by wins, compute head-to-head inside each group.
+  rows.sort((a, b) => b.wins - a.wins);
+  let i = 0;
+  while (i < rows.length) {
+    let j = i;
+    while (j < rows.length && rows[j].wins === rows[i].wins) j++;
+    h2h(rows.slice(i, j));
+    i = j;
+  }
+  rows.sort((a, b) => b.wins - a.wins || b.h2h - a.h2h
+    || (useBuchholz ? b.buchholz - a.buchholz : 0) || cmpName(a, b));
+  const top = rows.filter((r) => key(r) === key(rows[0]));
+  const tie = top.length > 1 ? top.map((r) => r.name) : null;
+  for (const r of rows) delete r.beat;
+  return { standings: rows, tie };
+}
+
+function applyMatch(stats, m) {
+  if (m.p1 == null || m.p2 == null) return;
+  if (m.winner !== 'p1' && m.winner !== 'p2') return;
+  const w = m.winner === 'p1' ? m.p1 : m.p2;
+  const l = m.winner === 'p1' ? m.p2 : m.p1;
+  stats[w].wins++; stats[l].losses++;
+  stats[w].played++; stats[l].played++;
+  stats[w].opponents.push(l); stats[l].opponents.push(w);
+  stats[w].beat.add(l);
+}
+
+/*
+ * Round robin. Every match in the schedule is listed up front; `w` holds one
+ * char per match in schedule order ('0' undecided, '1' p1, '2' p2).
+ */
+function roundRobin(players, w = '') {
+  const n = players.length;
+  const stats = emptyStats(players);
+  const rounds = [];
+  let i = 0;
+  let undecided = 0;
+  roundRobinSchedule(n).forEach((pairs, r) => {
+    const matches = pairs.map(([a, b], k) => {
+      const m = { id: `R${r + 1}-${k + 1}`, round: r + 1, p1: a, p2: b, winner: null, index: i };
+      if (b == null) { m.winner = 'bye'; return m; } // no code consumed
+      m.winner = decode(w, i++);
+      if (!m.winner) undecided++;
+      applyMatch(stats, m);
+      return m;
+    });
+    rounds.push({ round: r + 1, matches });
+  });
+  const { standings, tie } = rank(stats, false);
+  const complete = undecided === 0;
+  return {
+    kind: 'rr', players, rounds, matchCount: i, standings, complete, tie,
+    champion: complete && !tie ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null,
+  };
+}
+
+/*
+ * Swiss. `rounds` total; each round is paired from the current standings
+ * (top plays the next-best they haven't met). Odd counts: the lowest-ranked
+ * player without a bye yet sits out and takes a win. Pairings for round r+1
+ * only exist once round r is fully decided, so they're reproducible.
+ */
+function swiss(players, w = '', opts = {}) {
+  const n = players.length;
+  const totalRounds = Math.max(1, opts.rounds || Math.ceil(Math.log2(Math.max(2, n))));
+  const stats = emptyStats(players);
+  const byes = new Set();
+  const rounds = [];
+  let i = 0;
+  let complete = false;
+
+  for (let r = 1; r <= totalRounds; r++) {
+    // Order for pairing: by wins, then original seed (stable).
+    const order = stats.map((s) => s.idx).sort((a, b) => stats[b].wins - stats[a].wins || a - b);
+    const pending = [...order];
+    let byeIdx = null;
+    if (pending.length % 2 === 1) {
+      for (let k = pending.length - 1; k >= 0; k--) {
+        if (!byes.has(pending[k])) { byeIdx = pending.splice(k, 1)[0]; break; }
+      }
+      if (byeIdx == null) byeIdx = pending.pop();
+      byes.add(byeIdx);
+    }
+    const matches = [];
+    while (pending.length) {
+      const a = pending.shift();
+      let pick = pending.findIndex((b) => !stats[a].opponents.includes(b));
+      if (pick < 0) pick = 0; // everyone left is a rematch; take the nearest
+      const b = pending.splice(pick, 1)[0];
+      matches.push({ id: `R${r}-${matches.length + 1}`, round: r, p1: a, p2: b, winner: null, index: i++ });
+    }
+    if (byeIdx != null) {
+      matches.push({ id: `R${r}-${matches.length + 1}`, round: r, p1: byeIdx, p2: null, winner: 'bye', index: null });
+      stats[byeIdx].wins++; stats[byeIdx].played++; stats[byeIdx].bye = true;
+    }
+    let undecided = 0;
+    for (const m of matches) {
+      if (m.p2 == null) continue;
+      m.winner = decode(w, m.index);
+      if (!m.winner) undecided++;
+      applyMatch(stats, m);
+    }
+    rounds.push({ round: r, matches });
+    if (undecided > 0) break;          // next round can't be paired yet
+    if (r === totalRounds) complete = true;
+  }
+  const { standings, tie } = rank(stats, true);
+  return {
+    kind: 'swiss', players, rounds, totalRounds, matchCount: i, standings, complete, tie,
+    champion: complete && !tie ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null,
+  };
+}
+
+/* ======================= king of the hill ======================= */
+/*
+ * Winner stays on. Player 1 starts as king against player 2; the loser goes
+ * to the back of the queue. `w` is one char per game: '1' the king held,
+ * '2' the challenger took over. Open-ended — `finished` ends the session.
+ * Ranked by wins while king (the stat that matters here), then whoever
+ * currently holds the hill, then total wins.
+ */
+function kingOfTheHill(players, w = '', finished = false) {
+  const n = players.length;
+  const stats = players.map((name, idx) => ({ idx, name, kingWins: 0, wins: 0, losses: 0, reigns: 0, played: 0 }));
+  const queue = players.map((_, i) => i);
+  let king = queue.shift();
+  stats[king].reigns++;
+  const games = [];
+  const codes = typeof w === 'string' ? w : '';
+  for (let g = 0; g < codes.length; g++) {
+    const c = codes[g];
+    if (c !== '1' && c !== '2') break;
+    const challenger = queue.shift();
+    const game = { n: g + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
+    games.push(game);
+    stats[king].played++; stats[challenger].played++;
+    if (c === '1') {
+      stats[king].kingWins++; stats[king].wins++; stats[challenger].losses++;
+      queue.push(challenger);
+    } else {
+      stats[challenger].wins++; stats[challenger].reigns++; stats[king].losses++;
+      queue.push(king);
+      king = challenger;
+    }
+  }
+  const standings = [...stats].sort((a, b) => b.kingWins - a.kingWins
+    || (b.idx === king) - (a.idx === king) || b.wins - a.wins || cmpName(a, b));
+  const current = finished ? null : { king, challenger: queue[0] };
+  const champion = finished && games.length > 0
+    ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null;
+  return { kind: 'koth', players, games, king, queue: [...queue], current, standings, finished, complete: finished, tie: null, champion, n };
+}
+
+/* ======================= free-for-all ======================= */
+/*
+ * Everyone plays at once (a Mario Kart race, a hand of UNO). Each round is a
+ * finishing order; players who sat out score 0. `w` is rounds joined by '|',
+ * each round the player indices in finishing order as base-36 digits.
+ * Points per place default to n, n-1, ... 1 (opts.points overrides).
+ */
+function freeForAll(players, w = '', finished = false, opts = {}) {
+  const n = players.length;
+  const points = Array.isArray(opts.points) && opts.points.length
+    ? opts.points.map(Number) : players.map((_, i) => n - i);
+  const stats = players.map((name, idx) => ({ idx, name, points: 0, rounds: 0, places: Array(n).fill(0) }));
+  const rounds = [];
+  const chunks = typeof w === 'string' && w.length ? w.split('|') : [];
+  chunks.forEach((chunk, r) => {
+    const order = [];
+    for (const ch of chunk) {
+      const idx = parseInt(ch, 36);
+      if (Number.isNaN(idx) || idx < 0 || idx >= n || order.includes(idx)) continue;
+      order.push(idx);
+    }
+    if (!order.length) return;
+    order.forEach((idx, place) => {
+      stats[idx].points += points[place] || 0;
+      stats[idx].rounds++;
+      stats[idx].places[place]++;
+    });
+    rounds.push({ n: rounds.length + 1, order });
+  });
+  const placesCmp = (a, b) => {
+    for (let p = 0; p < n; p++) if (a.places[p] !== b.places[p]) return b.places[p] - a.places[p];
+    return 0;
+  };
+  const standings = [...stats].sort((a, b) => b.points - a.points || placesCmp(a, b) || cmpName(a, b));
+  const level = (a, b) => a.points === b.points && placesCmp(a, b) === 0;
+  const top = standings.filter((s) => level(s, standings[0]));
+  const tie = rounds.length && top.length > 1 ? top.map((s) => s.name) : null;
+  const champion = finished && rounds.length > 0 && !tie
+    ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null;
+  return { kind: 'ffa', players, rounds, points, standings, finished, complete: finished, tie, champion };
+}
+
+// Encode a finishing order for freeForAll's `w`.
+function encodeFfaRound(order) {
+  return order.map((i) => i.toString(36)).join('');
+}
+
+/* ======================= summaries for tracking ======================= */
+
+// One-line standings summary stored alongside a recorded result, e.g.
+// "Dad=3-1, Mum=2-2" (rr/swiss), "Dad=5" wins-as-king (koth), "Dad=21" points (ffa).
+function standingsSummary(result) {
+  const s = result.standings;
+  switch (result.kind) {
+    case 'rr':
+    case 'swiss': return s.map((r) => `${r.name}=${r.wins}-${r.losses}`).join(', ');
+    case 'koth': return s.map((r) => `${r.name}=${r.kingWins}`).join(', ');
+    case 'ffa': return s.map((r) => `${r.name}=${r.points}`).join(', ');
+    default: return '';
+  }
+}
+
+/*
+ * ha-bracket-card — a reusable game-night tournament card for Home Assistant.
  *
  * Frontend-only custom Lovelace card. All state lives in a single `input_text`
- * (or `text`) helper as a compact JSON string; the full match graph is
- * regenerated deterministically from the player list, so what we persist stays
- * small. Tap a name to advance them. One button starts a fresh bracket.
+ * (or `text`) helper as a compact JSON string; the full tournament is
+ * regenerated deterministically from the player list plus the decisions, so
+ * what we persist stays small. Tap a name to advance them. One button starts
+ * a fresh tournament.
+ *
+ * Formats: double elimination, single elimination, round robin, Swiss,
+ * king of the hill and free-for-all (points race).
  *
  * Config:
  *   type: custom:bracket-card
  *   entity: input_text.game_night_bracket   # required, a text helper you own
  *   title: Game Night                         # optional
- *   reset_bracket: true                       # optional, grand-final reset game
+ *   reset_bracket: true                       # optional, grand-final reset game (double elim)
+ *   default_game: Mario Kart                  # optional, pre-fills the Game box
+ *   default_mode: double                      # optional, pre-selects the format
+ *   ffa_points: [10, 7, 5, 3, 2, 1]           # optional, free-for-all points per place
  *   tracking: true                            # optional, record results in InfluxDB
  *
  * Tracking goes through two Home Assistant rest_commands (see README), because
@@ -431,26 +734,81 @@ function slotLabel(ref) {
  * the current champion, past winners and a leaderboard.
  */
 
-const CARD_VERSION = '1.2.0';
+const CARD_VERSION = '1.3.0';
+
+/* ---------- formats ---------- */
+// Mode is stored as a single character in the helper.
+const MODES = {
+  d: { label: 'Double elimination', tag: 'double_elimination', bracket: true,
+       help: 'Lose twice and you are out. A losers bracket gives everyone a second chance.' },
+  s: { label: 'Single elimination', tag: 'single_elimination', bracket: true,
+       help: 'Lose once and you are out. Quickest format.' },
+  r: { label: 'Round robin', tag: 'round_robin',
+       help: 'Everyone plays everyone once. Most wins takes it; ties go to a decider.' },
+  w: { label: 'Swiss system', tag: 'swiss',
+       help: 'A fixed number of rounds; each round you play someone on the same record. Nobody is knocked out.' },
+  k: { label: 'King of the hill', tag: 'king_of_the_hill',
+       help: 'Winner stays on. Most wins while holding the top spot takes it.' },
+  f: { label: 'Free-for-all', tag: 'free_for_all',
+       help: 'Everyone plays at once (a race, a hand). Enter each round\u2019s finishing order; points decide it.' },
+};
+const MODE_ALIASES = {
+  double: 'd', double_elimination: 'd', single: 's', single_elimination: 's',
+  round_robin: 'r', roundrobin: 'r', rr: 'r', swiss: 'w', king_of_the_hill: 'k', koth: 'k',
+  free_for_all: 'f', ffa: 'f', points: 'f',
+};
+function modeChar(v) {
+  const s = String(v || '').toLowerCase().replace(/[\s-]+/g, '_');
+  if (MODES[s]) return s;
+  return MODE_ALIASES[s] || 'd';
+}
 
 /* ---------- compact persistence ---------- */
-// Persisted form: {"v":2,"p":[names],"w":"codes","x":0|1,"g":"game","c":epoch,"r":1}
-// `w` is one char per match in canonical order: '0' undecided, '1' p1, '2' p2.
-// `g` (game name), `c` (created, epoch seconds) and `r` (result recorded) are
-// optional so brackets stored by older versions still decode.
+// Persisted form:
+//   {"v":2,"p":[names],"w":"codes","x":0|1,"m":"d","g":"game","c":epoch,"r":1,"d":"codes","f":1,"k":3}
+// `w` holds the decisions: one char per match ('0' undecided, '1' p1, '2' p2)
+// for bracket / round robin / Swiss and king of the hill, or the finishing
+// orders for free-for-all. `m` mode (default double elim), `d` decider
+// decisions for a tied round robin / Swiss, `f` finished (koth / ffa),
+// `k` Swiss round count, `g` game, `c` created (epoch s), `r` recorded.
+// All but p/w are optional so brackets stored by older versions still decode.
 
-function encodeState(players, resetBracket, decisions, meta = {}) {
-  // Rebuild to obtain canonical order, then emit codes for user decisions only.
-  const s = rebuild(players, resetBracket, decisions);
+function bracketOpts(d) {
+  return { single: d.mode === 's', resetBracket: d.mode === 'd' && d.resetBracket };
+}
+
+function codesToDecisions(players, opts, w) {
+  const decisions = {};
+  const order = generateBracket(players, opts).order;
+  order.forEach((id, i) => {
+    const c = typeof w === 'string' ? w[i] : undefined;
+    if (c === '1') decisions[id] = 'p1';
+    else if (c === '2') decisions[id] = 'p2';
+  });
+  return decisions;
+}
+
+function decisionsToCodes(players, opts, decisions) {
+  const s = rebuild(players, opts, decisions);
   let w = '';
   for (const id of s.order) {
     const d = decisions[id];
     w += d === 'p1' ? '1' : d === 'p2' ? '2' : '0';
   }
-  const out = { v: 2, p: players, w, x: resetBracket ? 1 : 0 };
-  if (meta.game) out.g = meta.game;
-  if (meta.created) out.c = meta.created;
-  if (meta.recorded) out.r = 1;
+  return w;
+}
+
+function encodeState(d) {
+  const out = { v: 2, p: d.players };
+  out.w = MODES[d.mode].bracket ? decisionsToCodes(d.players, bracketOpts(d), d.decisions) : (d.w || '');
+  out.x = d.resetBracket ? 1 : 0;
+  if (d.mode !== 'd') out.m = d.mode;
+  if (d.decider) out.d = d.decider;
+  if (d.finished) out.f = 1;
+  if (d.swissRounds) out.k = d.swissRounds;
+  if (d.game) out.g = d.game;
+  if (d.created) out.c = d.created;
+  if (d.recorded) out.r = 1;
   return JSON.stringify(out);
 }
 
@@ -461,22 +819,109 @@ function decodeState(raw) {
   let obj;
   try { obj = JSON.parse(trimmed); } catch (e) { return null; }
   if (!obj || !Array.isArray(obj.p) || obj.p.length < 2) return null;
-  const resetBracket = obj.x !== 0;
-  // Map winners string back to a decisions object using a fresh graph's order.
-  const fresh = generateBracket(obj.p, { resetBracket });
-  const decisions = {};
-  const w = typeof obj.w === 'string' ? obj.w : '';
-  fresh.order.forEach((id, i) => {
-    const c = w[i];
-    if (c === '1') decisions[id] = 'p1';
-    else if (c === '2') decisions[id] = 'p2';
-  });
-  return {
-    players: obj.p, resetBracket, decisions,
+  const d = {
+    players: obj.p,
+    mode: MODES[obj.m] ? obj.m : 'd',
+    w: typeof obj.w === 'string' ? obj.w : '',
+    resetBracket: obj.x !== 0,
+    decider: typeof obj.d === 'string' ? obj.d : '',
+    finished: obj.f === 1,
+    swissRounds: Number.isInteger(obj.k) && obj.k > 0 ? obj.k : 0,
     game: typeof obj.g === 'string' ? obj.g : '',
     created: Number.isFinite(obj.c) ? obj.c : 0,
     recorded: obj.r === 1,
   };
+  d.decisions = MODES[d.mode].bracket ? codesToDecisions(d.players, bracketOpts(d), d.w) : {};
+  return d;
+}
+
+/* ---------- rebuild from decisions ---------- */
+// Regenerate the graph and replay user decisions in canonical (topological)
+// order. Byes auto-resolve; invalid decisions (slot no longer a real player)
+// are dropped. Returns a fully resolved state.
+function rebuild(players, opts, decisions) {
+  const s = generateBracket(players, opts);
+  for (const id of s.order) {
+    const d = decisions[id];
+    if (d !== 'p1' && d !== 'p2') continue;
+    const m = s.matches[id];
+    if (!m || m.winner) continue;              // already auto-decided (bye) -> skip
+    if (!isRealPlayer(m.p1) || !isRealPlayer(m.p2)) continue;
+    setWinner(s, id, d);
+  }
+  resolve(s);
+  return s;
+}
+
+/*
+ * Turn a decoded state into what the views render. Every mode yields
+ * { kind, champion, complete } plus its own data; a tied round robin / Swiss
+ * also carries a single-elimination decider bracket among the tied players.
+ */
+function compute(d, config) {
+  const mode = d.mode;
+  if (MODES[mode].bracket) {
+    const state = rebuild(d.players, bracketOpts(d), d.decisions);
+    const c = champion(state);
+    return { kind: 'bracket', state, champion: c, complete: !!c, standings: null };
+  }
+  let res;
+  if (mode === 'r') res = roundRobin(d.players, d.w);
+  else if (mode === 'w') res = swiss(d.players, d.w, { rounds: d.swissRounds || undefined });
+  else if (mode === 'k') res = kingOfTheHill(d.players, d.w, d.finished);
+  else res = freeForAll(d.players, d.w, d.finished, { points: config && config.ffa_points });
+  if ((mode === 'r' || mode === 'w') && res.complete && res.tie) {
+    const opts = { single: true, resetBracket: false };
+    const decisions = codesToDecisions(res.tie, opts, d.decider);
+    res.decider = rebuild(res.tie, opts, decisions);
+    const c = champion(res.decider);
+    if (c) res.champion = c;
+  }
+  return res;
+}
+
+function isRealPlayer(ref) { return ref && ref.type === 'player'; }
+
+// Fisher-Yates, in place.
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// All matches reachable downstream of `matchId` via winner/loser routing,
+// plus the grand-final reset game. Used to clear stale results on a re-pick.
+function descendants(state, matchId) {
+  const out = new Set();
+  const stack = [matchId];
+  while (stack.length) {
+    const cur = state.matches[stack.pop()];
+    if (!cur) continue;
+    for (const link of [cur.winnerTo, cur.loserTo]) {
+      if (link && link.match && !out.has(link.match)) {
+        out.add(link.match);
+        stack.push(link.match);
+      }
+    }
+  }
+  if (matchId === 'GF-1' && state.matches['GF-2']) out.add('GF-2');
+  out.delete(matchId);
+  return out;
+}
+
+// Apply a pick to a bracket's decisions object (main bracket or decider).
+function pickInBracket(players, opts, decisions, matchId, side) {
+  const s = rebuild(players, opts, decisions);
+  const m = s.matches[matchId];
+  if (!m || !isRealPlayer(m[side])) return false;
+  // Re-pick: if this match was already decided differently, clear downstream.
+  if (decisions[matchId] && decisions[matchId] !== side) {
+    for (const x of descendants(s, matchId)) delete decisions[x];
+  }
+  decisions[matchId] = side;
+  return true;
 }
 
 /* ---------- result tracking (InfluxDB via rest_command) ---------- */
@@ -500,17 +945,19 @@ function trackingConfig(config) {
 const lpTag = (v) => String(v).replace(/[,= \\]/g, (c) => '\\' + c);
 const lpStr = (v) => '"' + String(v).replace(/[\\"]/g, (c) => '\\' + c) + '"';
 
-function resultLine(measurement, { game, winner, runnerUp, players, created }) {
-  const tags = `game=${lpTag(game || 'Untitled')}`;
+function resultLine(measurement, { game, mode, winner, runnerUp, players, created, standings, topWins }) {
+  const tags = `game=${lpTag(game || 'Untitled')},mode=${lpTag(MODES[mode].tag)}`;
   const fields = [
     `winner=${lpStr(winner)}`,
     `runner_up=${lpStr(runnerUp || '')}`,
     `players=${lpStr(players.join(', '))}`,
     `player_count=${players.length}i`,
-  ].join(',');
+  ];
+  if (standings) fields.push(`standings=${lpStr(standings)}`);
+  if (Number.isInteger(topWins)) fields.push(`top_wins=${topWins}i`);
   // Timestamp = bracket creation (seconds), so re-recording a corrected result
   // overwrites the same point instead of adding a second one.
-  return `${measurement},${tags} ${fields} ${created}`;
+  return `${measurement},${tags} ${fields.join(',')} ${created}`;
 }
 
 // Call a "domain.service" and return its response (needs return_response).
@@ -551,53 +998,15 @@ function fmtDate(epochSec) {
   return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
-/* ---------- rebuild from decisions ---------- */
-// Regenerate the graph and replay user decisions in canonical (topological)
-// order. Byes auto-resolve; invalid decisions (slot no longer a real player)
-// are dropped. Returns a fully resolved state.
-function rebuild(players, resetBracket, decisions) {
-  const s = generateBracket(players, { resetBracket });
-  for (const id of s.order) {
-    const d = decisions[id];
-    if (d !== 'p1' && d !== 'p2') continue;
-    const m = s.matches[id];
-    if (!m || m.winner) continue;              // already auto-decided (bye) -> skip
-    if (!isRealPlayer(m.p1) || !isRealPlayer(m.p2)) continue;
-    setWinner(s, id, d);
-  }
-  resolve(s);
-  return s;
-}
+const modeLabelFromTag = (tag) => {
+  for (const m of Object.values(MODES)) if (m.tag === tag) return m.label;
+  return tag ? String(tag).replace(/_/g, ' ') : '';
+};
 
-function isRealPlayer(ref) { return ref && ref.type === 'player'; }
-
-// Fisher-Yates, in place.
-function shuffle(arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
-// All matches reachable downstream of `matchId` via winner/loser routing,
-// plus the grand-final reset game. Used to clear stale results on a re-pick.
-function descendants(state, matchId) {
-  const out = new Set();
-  const stack = [matchId];
-  while (stack.length) {
-    const cur = state.matches[stack.pop()];
-    if (!cur) continue;
-    for (const link of [cur.winnerTo, cur.loserTo]) {
-      if (link && link.match && !out.has(link.match)) {
-        out.add(link.match);
-        stack.push(link.match);
-      }
-    }
-  }
-  if (matchId === 'GF-1' && state.matches['GF-2']) out.add('GF-2');
-  out.delete(matchId);
-  return out;
+function ordinal(n) {
+  const r = n % 100;
+  if (r >= 11 && r <= 13) return n + 'th';
+  return n + (['th', 'st', 'nd', 'rd'][n % 10] || 'th');
 }
 
 /* ---------- the card ---------- */
@@ -610,7 +1019,11 @@ class BracketCard extends HTMLElement {
     this._lastRaw = undefined;
     this._draft = '';       // setup textarea contents
     this._game = '';        // setup game-name input
+    this._mode = 'd';       // setup format select
+    this._swissRounds = ''; // setup rounds input (Swiss), '' = automatic
+    this._ffaOrder = [];    // free-for-all: finishing order being entered
     this._confirmReset = false;
+    this._confirmFinish = false;
     this._track = { busy: false, error: null };
   }
 
@@ -624,6 +1037,7 @@ class BracketCard extends HTMLElement {
     this._config = { reset_bracket: true, ...config };
     this._tracking = trackingConfig(this._config); // validates, throws on bad config
     if (!this._game && config.default_game) this._game = String(config.default_game);
+    if (config.default_mode) this._mode = modeChar(config.default_mode);
     this._lastRaw = undefined;
     this._render();
   }
@@ -653,15 +1067,21 @@ class BracketCard extends HTMLElement {
     });
   }
 
-  _save(players, resetBracket, decisions, meta) {
-    const value = encodeState(players, resetBracket, decisions, meta);
+  _save(decoded) {
+    const value = encodeState(decoded);
+    if (value.length > 255 && /^input_text\./.test(this._config.entity)) {
+      this._flash('Too much data for a 255-char input_text. Use shorter names, fewer players, or a "text" helper with a higher max.');
+      return false;
+    }
     this._lastRaw = value; // optimistic; avoids a flash before HA echoes back
     this._setValue(value);
     this._render(); // optimistic; HA will echo the same value and be a no-op
+    return true;
   }
 
   _clear() {
     this._confirmReset = false;
+    this._ffaOrder = [];
     this._lastRaw = '';
     this._setValue('');
     this._render();
@@ -672,62 +1092,125 @@ class BracketCard extends HTMLElement {
     const names = this._draft.split('\n').map((n) => n.trim()).filter(Boolean);
     if (names.length < 2) { this._flash('Enter at least two players (one per line).'); return; }
     if (names.length > 64) { this._flash('That is a lot of players — cap is 64.'); return; }
-    const resetBracket = this._config.reset_bracket !== false;
+    if (this._mode === 'f' && names.length > 36) { this._flash('Free-for-all supports up to 36 players.'); return; }
     // Entry order is seeding order, and a typed list is rarely random — so
     // shuffle once here. The shuffled order is what gets stored, so the
-    // bracket is stable from then on.
+    // draw is stable from then on.
     shuffle(names);
-    const meta = { game: this._game.trim(), created: Math.floor(Date.now() / 1000) };
-    const value = encodeState(names, resetBracket, {}, meta);
-    if (value.length > 255 && /^input_text\./.test(this._config.entity)) {
-      this._flash('Too much data for a 255-char input_text. Use shorter names, fewer players, or a "text" helper with a higher max.');
-      return;
-    }
+    const swissRounds = this._mode === 'w' ? Math.max(0, parseInt(this._swissRounds, 10) || 0) : 0;
     this._track = { busy: false, error: null };
-    this._save(names, resetBracket, {}, meta);
+    this._ffaOrder = [];
+    this._save({
+      players: names, mode: this._mode, w: '', decisions: {},
+      resetBracket: this._config.reset_bracket !== false,
+      decider: '', finished: false, swissRounds,
+      game: this._game.trim(), created: Math.floor(Date.now() / 1000), recorded: false,
+    });
   }
 
+  // Tap handler for every format. matchId is a bracket match id, "dec:<id>"
+  // for the tie decider, "koth" for the current king-of-the-hill game, or a
+  // round robin / Swiss match id.
   _pick(matchId, side) {
-    const decoded = decodeState(this._lastRaw);
-    if (!decoded) return;
-    const { players, resetBracket } = decoded;
-    const decisions = { ...decoded.decisions };
-    const s = rebuild(players, resetBracket, decisions);
-    const m = s.matches[matchId];
-    if (!m || !isRealPlayer(m[side])) return;
+    const d = decodeState(this._lastRaw);
+    if (!d || d.finished) return;
 
-    // Re-pick: if this match was already decided differently, clear downstream.
-    if (decisions[matchId] && decisions[matchId] !== side) {
-      for (const d of descendants(s, matchId)) delete decisions[d];
+    if (MODES[d.mode].bracket) {
+      const decisions = { ...d.decisions };
+      if (!pickInBracket(d.players, bracketOpts(d), decisions, matchId, side)) return;
+      d.decisions = decisions;
+    } else if (matchId.startsWith('dec:')) {
+      const res = compute(d, this._config);
+      if (!res.decider) return;
+      const opts = { single: true, resetBracket: false };
+      const decisions = codesToDecisions(res.tie, opts, d.decider);
+      if (!pickInBracket(res.tie, opts, decisions, matchId.slice(4), side)) return;
+      d.decider = decisionsToCodes(res.tie, opts, decisions);
+    } else if (d.mode === 'k') {
+      d.w += side === 'p1' ? '1' : '2';
+    } else {
+      // round robin / Swiss: one code per match, addressed by its index.
+      const res = compute(d, this._config);
+      let match = null;
+      for (const r of res.rounds) for (const m of r.matches) if (m.id === matchId) match = m;
+      if (!match || match.index == null) return;
+      const codes = d.w.padEnd(match.index + 1, '0').split('');
+      const code = side === 'p1' ? '1' : '2';
+      if (codes[match.index] === code) return;
+      codes[match.index] = code;
+      d.w = codes.join('');
+      // Changing an earlier Swiss round invalidates the pairings after it.
+      if (d.mode === 'w') {
+        const lastIdx = Math.max(...res.rounds.find((r) => r.round === match.round).matches
+          .map((m) => (m.index == null ? -1 : m.index)));
+        d.w = d.w.slice(0, lastIdx + 1);
+      }
+      d.decider = '';
     }
-    decisions[matchId] = side;
-    const meta = { game: decoded.game, created: decoded.created, recorded: decoded.recorded };
-    const done = champion(rebuild(players, resetBracket, decisions));
-    // A correction that un-decides the tournament also un-records it, so the
-    // corrected result gets written (over the same point) when it's decided.
-    if (!done) meta.recorded = false;
-    this._save(players, resetBracket, decisions, meta);
-    if (done && this._tracking && !meta.recorded) this._recordResult(done);
+    this._afterChange(d);
+  }
+
+  // King of the hill / free-for-all: take back the last game or round, or
+  // reopen a finished session.
+  _undo() {
+    const d = decodeState(this._lastRaw);
+    if (!d) return;
+    if (d.finished) d.finished = false;
+    else if (d.mode === 'k') d.w = d.w.slice(0, -1);
+    else if (d.mode === 'f') d.w = d.w.split('|').filter(Boolean).slice(0, -1).join('|');
+    this._afterChange(d);
+  }
+
+  _finish() {
+    const d = decodeState(this._lastRaw);
+    if (!d || d.finished) return;
+    this._confirmFinish = false;
+    d.finished = true;
+    this._afterChange(d);
+  }
+
+  _saveFfaRound() {
+    const d = decodeState(this._lastRaw);
+    if (!d || d.mode !== 'f' || d.finished) return;
+    if (this._ffaOrder.length < 2) { this._flash('Tap at least two players in finishing order.'); return; }
+    const chunk = encodeFfaRound(this._ffaOrder);
+    d.w = d.w ? `${d.w}|${chunk}` : chunk;
+    this._ffaOrder = [];
+    this._afterChange(d);
+  }
+
+  // Persist, then record the result if it's decided. Any change invalidates
+  // an earlier record (a re-pick can change the standings without un-deciding
+  // a round robin), and the re-write lands on the same point.
+  _afterChange(d) {
+    const res = compute(d, this._config);
+    d.recorded = false;
+    if (!this._save(d)) return;
+    if (res.champion && this._tracking) this._recordResult(res);
   }
 
   // Write the decided result to InfluxDB through the configured rest_command,
-  // then flag the bracket as recorded so no device writes it twice.
-  async _recordResult(champ) {
+  // then flag the tournament as recorded so no device writes it twice.
+  async _recordResult(res) {
     if (this._track.busy) return;
-    const decoded = decodeState(this._lastRaw);
-    if (!decoded) return;
+    const d = decodeState(this._lastRaw);
+    if (!d || !res.champion) return;
     this._track = { busy: true, error: null };
     this._render();
+    const champ = res.champion;
+    const topWins = res.kind === 'koth'
+      ? (res.standings.find((s) => s.name === champ.name) || {}).kingWins : undefined;
     const line = resultLine(this._tracking.measurement, {
-      game: decoded.game, winner: champ.name, runnerUp: champ.runnerUp,
-      players: decoded.players, created: decoded.created || Math.floor(Date.now() / 1000),
+      game: d.game, mode: d.mode, winner: champ.name, runnerUp: champ.runnerUp,
+      players: d.players, created: d.created || Math.floor(Date.now() / 1000),
+      standings: standingsSummary(res), topWins,
     });
     try {
       await callWithResponse(this._hass, this._tracking.write_service, { line });
       this._track = { busy: false, error: null };
-      const fresh = decodeState(this._lastRaw) || decoded;
-      this._save(fresh.players, fresh.resetBracket, fresh.decisions,
-        { game: fresh.game, created: fresh.created, recorded: true });
+      const fresh = decodeState(this._lastRaw) || d;
+      fresh.recorded = true;
+      this._save(fresh);
     } catch (e) {
       const msg = (e && (e.message || e.error)) || String(e);
       this._track = { busy: false, error: msg };
@@ -747,8 +1230,9 @@ class BracketCard extends HTMLElement {
     if (!this._config) { this.shadowRoot.innerHTML = ''; return; }
     const title = this._config.title || 'Tournament Bracket';
     const decoded = this._hass ? decodeState(this._lastRaw) : null;
+    this._lineJobs = [];
+    this._result = null;
 
-    const style = STYLE;
     let body;
     if (!this._hass) {
       body = `<div class="pad muted">Loading…</div>`;
@@ -757,49 +1241,54 @@ class BracketCard extends HTMLElement {
     } else if (!decoded) {
       body = this._setupView();
     } else {
-      body = this._bracketView(decoded);
+      const res = compute(decoded, this._config);
+      this._result = res;
+      body = this._banner(decoded, res)
+        + (res.kind === 'bracket' ? this._bracketView(res.state, 'main', decoded.mode === 's')
+          : res.kind === 'koth' ? this._kothView(decoded, res)
+          : res.kind === 'ffa' ? this._ffaView(decoded, res)
+          : this._pairedView(decoded, res));
     }
 
     this.shadowRoot.innerHTML = `
       <ha-card>
         <div class="hdr">
           <div class="title">${esc(title)}${decoded && decoded.game
-            ? `<span class="game">${esc(decoded.game)}</span>` : ``}</div>
-          ${decoded ? `<button class="ghost" id="new">New bracket</button>` : ``}
+            ? `<span class="pill">${esc(decoded.game)}</span>` : ``}${decoded
+            ? `<span class="pill mode">${esc(MODES[decoded.mode].label)}</span>` : ``}</div>
+          ${decoded ? `<button class="ghost" id="new">New game</button>` : ``}
         </div>
         ${this._msg ? `<div class="flash">${esc(this._msg)}</div>` : ``}
         ${this._confirmReset ? `
           <div class="confirm">
-            <span>Clear this bracket and start over?</span>
+            <span>Clear this tournament and start over?</span>
             <button class="danger" id="do-reset">Yes, clear</button>
             <button class="ghost" id="cancel-reset">Cancel</button>
           </div>` : ``}
         ${body}
         <div class="foot">bracket-card v${CARD_VERSION}</div>
       </ha-card>
-      <style>${style}</style>
+      <style>${STYLE}</style>
     `;
 
     this._wire(decoded);
 
-    // Connector lines are measured from laid-out positions, so they can only
-    // be drawn once the browser has done layout.
-    // Measuring forces layout, so the lines can be drawn right away; the
-    // next-frame pass catches late font metrics, and the observer handles
-    // resizes (e.g. the sidebar opening).
+    // Connector lines are measured from laid-out positions. Measuring forces
+    // layout, so they can be drawn right away; the next-frame pass catches
+    // late font metrics, and the observer handles resizes.
     this._drawLines();
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => this._drawLines());
     this._observeResize();
   }
 
-  // Every render replaces the DOM, so re-point the observer at the new element.
+  // Every render replaces the DOM, so re-point the observer at the new elements.
   _observeResize() {
     if (typeof ResizeObserver === 'undefined') return;
     if (this._ro) this._ro.disconnect();
-    const wrap = this.shadowRoot.querySelector('.bracket');
-    if (!wrap) return;
+    const wraps = this.shadowRoot.querySelectorAll('.bracket');
+    if (!wraps.length) return;
     this._ro = this._ro || new ResizeObserver(() => this._drawLines());
-    this._ro.observe(wrap);
+    wraps.forEach((w) => this._ro.observe(w));
   }
 
   disconnectedCallback() {
@@ -807,24 +1296,53 @@ class BracketCard extends HTMLElement {
   }
 
   _setupView() {
+    const modeOpts = Object.entries(MODES).map(([k, m]) =>
+      `<option value="${k}" ${k === this._mode ? 'selected' : ''}>${esc(m.label)}</option>`).join('');
     return `
       <div class="pad">
         <label class="lbl" for="game">Game</label>
         <input id="game" type="text" placeholder="e.g. Mario Kart, UNO" value="${esc(this._game)}" maxlength="40">
+        <label class="lbl" for="mode">Format</label>
+        <select id="mode">${modeOpts}</select>
+        <p class="muted small">${esc(MODES[this._mode].help)}</p>
+        ${this._mode === 'w' ? `
+          <label class="lbl" for="rounds">Rounds</label>
+          <input id="rounds" type="number" min="1" max="20" placeholder="automatic (log\u2082 of players)" value="${esc(this._swissRounds)}">` : ''}
         <label class="lbl" for="draft">Players</label>
-        <p class="muted">One per line. The draw is shuffled and a double-elimination bracket is built automatically.</p>
+        <p class="muted small">One per line. The order is shuffled when you start.</p>
         <textarea id="draft" rows="8" placeholder="Alice&#10;Bob&#10;Charlie&#10;Dana">${esc(this._draft)}</textarea>
         <div class="row">
-          <button class="primary" id="create">Create bracket</button>
+          <button class="primary" id="create">Start</button>
         </div>
       </div>`;
   }
 
-  _bracketView(decoded) {
-    const { players, resetBracket, decisions } = decoded;
-    const s = rebuild(players, resetBracket, decisions);
-    this._state = s; // _drawLines reads winnerTo routing from here
-    const champ = champion(s);
+  // Champion / tie banner with the tracking status, shared by every format.
+  _banner(decoded, res) {
+    const champ = res.champion;
+    let trackNote = '';
+    if (champ && this._tracking) {
+      if (this._track.busy) trackNote = `<span class="tnote">Saving result…</span>`;
+      else if (this._track.error) trackNote = `<span class="tnote terr">Not saved: ${esc(this._track.error)}</span> <button class="ghost small" id="retry">Retry</button>`;
+      else if (decoded.recorded) trackNote = `<span class="tnote">Result recorded ✓</span>`;
+      else trackNote = `<button class="ghost small" id="retry">Record result</button>`;
+    }
+    if (champ) {
+      const extra = res.kind === 'koth'
+        ? ` <span class="tnote">${(res.standings[0] || {}).kingWins || 0} wins on top</span>` : '';
+      return `<div class="champ">🏆 Champion:&nbsp;<strong>${esc(champ.name)}</strong>${extra}${trackNote}</div>`;
+    }
+    if (res.tie && (res.kind === 'ffa' || res.complete) && !res.decider) {
+      return `<div class="tie">Tied at the top: ${res.tie.map(esc).join(', ')}${res.kind === 'ffa'
+        ? ' — play another round to split them.' : ''}</div>`;
+    }
+    return '';
+  }
+
+  /* ----- bracket (double / single elimination) ----- */
+  _bracketView(s, key, single) {
+    this._lineJobs.push({ key, state: s });
+    const prefix = key === 'main' ? '' : `${key}:`;
 
     const groups = { W: {}, L: {} };
     let gf1 = null, gf2 = null;
@@ -834,17 +1352,6 @@ class BracketCard extends HTMLElement {
       (groups[m.bracket][m.round] ||= []).push(m);
     }
 
-    let trackNote = '';
-    if (champ && this._tracking) {
-      if (this._track.busy) trackNote = `<span class="tnote">Saving result…</span>`;
-      else if (this._track.error) trackNote = `<span class="tnote terr">Not saved: ${esc(this._track.error)}</span> <button class="ghost small" id="retry">Retry</button>`;
-      else if (decoded.recorded) trackNote = `<span class="tnote">Result recorded ✓</span>`;
-      else trackNote = `<button class="ghost small" id="retry">Record result</button>`;
-    }
-    const champBanner = champ
-      ? `<div class="champ">🏆 Champion:&nbsp;<strong>${esc(champ.name)}</strong>${trackNote}</div>`
-      : ``;
-
     // Every column stretches to the section's height and spreads its matches
     // evenly, so a match in round r+1 sits centred between the two that feed
     // it. Hidden (bye-vs-bye) matches keep their slot so that stays true.
@@ -853,30 +1360,29 @@ class BracketCard extends HTMLElement {
       if (!rounds.length) return '';
       const cols = rounds.map((r) => `
         <div class="col">
-          <div class="col-h">${roundName(cls, r, rounds.length)}</div>
-          <div class="col-body">${roundsObj[r].map((m) => this._matchHtml(m)).join('')}</div>
+          <div class="col-h">${roundName(single ? 'se' : cls, r, rounds.length)}</div>
+          <div class="col-body">${roundsObj[r].map((m) => this._matchHtml(m, '', prefix)).join('')}</div>
         </div>`).join('');
-      return `<div class="section ${cls}"><div class="sec-h ${cls}">${label}</div><div class="cols">${cols}</div></div>`;
+      return `<div class="section ${cls}">${label ? `<div class="sec-h ${cls}">${label}</div>` : ''}<div class="cols">${cols}</div></div>`;
     };
 
     // The reset game only exists once the losers-bracket entrant has won GF-1.
     const showGf2 = gf2 && (isRealPlayer(gf2.p1) || isRealPlayer(gf2.p2));
-    const gfCol = `
+    const gfCol = gf1 ? `
       <div class="gf-col">
         <div class="sec-h gf">Grand Final</div>
         <div class="gf-body">
-          ${gf1 ? this._matchHtml(gf1) : ''}
-          ${showGf2 ? this._matchHtml(gf2, 'Reset game') : ''}
+          ${this._matchHtml(gf1, '', prefix)}
+          ${showGf2 ? this._matchHtml(gf2, 'Reset game', prefix) : ''}
         </div>
-      </div>`;
+      </div>` : '';
 
     return `
-      ${champBanner}
       <div class="scroll">
-        <div class="bracket">
+        <div class="bracket" data-key="${key}">
           <svg class="lines" aria-hidden="true"></svg>
           <div class="left">
-            ${section('Winners Bracket', groups.W, 'wb')}
+            ${section(single ? '' : 'Winners Bracket', groups.W, 'wb')}
             ${section('Losers Bracket', groups.L, 'lb')}
           </div>
           ${gfCol}
@@ -884,22 +1390,22 @@ class BracketCard extends HTMLElement {
       </div>`;
   }
 
-  _matchHtml(m, tag = '') {
+  _matchHtml(m, tag = '', prefix = '') {
     // A match with a bye on both sides is scaffolding, not a game: it exists
     // so the tree stays a power of two. Keep its slot (for centring) but
     // don't show it.
     const hidden = m.winner === 'bye' || (isBye(m.p1) && isBye(m.p2));
     const row = (side) => {
       const ref = m[side];
-      const label = slotLabel(ref) || '&nbsp;';
+      const label = slotLabel(ref);
       const real = isRealPlayer(ref);
       const isWinner = m.winner === side;
       const isLoser = m.winner && m.winner !== side && m.winner !== 'bye';
       const cls = ['p', real ? 'real' : 'empty', isWinner ? 'win' : '', isLoser ? 'lose' : '']
         .join(' ').trim();
       const clickable = real && !isWinner && isRealPlayer(m.p1) && isRealPlayer(m.p2);
-      return `<div class="${cls}" data-match="${m.id}" data-side="${side}" data-click="${clickable ? 1 : 0}">
-                <span class="nm">${label}</span>${isWinner ? '<span class="chk">✓</span>' : ''}
+      return `<div class="${cls}" data-match="${prefix}${m.id}" data-side="${side}" data-click="${clickable ? 1 : 0}">
+                <span class="nm">${label ? esc(label) : '&nbsp;'}</span>${isWinner ? '<span class="chk">✓</span>' : ''}
               </div>`;
     };
     return `<div class="match${hidden ? ' hidden' : ''}" data-id="${m.id}">
@@ -911,71 +1417,210 @@ class BracketCard extends HTMLElement {
   }
 
   /*
-   * Draw the connectors as one SVG path over the bracket, measured from where
-   * the matches actually landed. Measuring (rather than a pure-CSS bracket)
-   * is what lets the lines survive hidden bye matches and the losers
-   * bracket's uneven wiring, and lets both finals converge on the grand
-   * final off to the right.
+   * Draw the connectors as one SVG path over each bracket, measured from
+   * where the matches actually landed. Measuring (rather than a pure-CSS
+   * bracket) is what lets the lines survive hidden bye matches and the
+   * losers bracket's uneven wiring, and lets both finals converge on the
+   * grand final off to the right.
    */
   _drawLines() {
     const root = this.shadowRoot;
-    const wrap = root && root.querySelector('.bracket');
-    const svg = root && root.querySelector('svg.lines');
-    const st = this._state;
-    if (!wrap || !svg || !st) return;
+    if (!root || !this._lineJobs) return;
+    for (const job of this._lineJobs) {
+      const wrap = root.querySelector(`.bracket[data-key="${job.key}"]`);
+      const svg = wrap && wrap.querySelector('svg.lines');
+      const st = job.state;
+      if (!wrap || !svg || !st) continue;
 
-    const els = new Map();
-    wrap.querySelectorAll('.match[data-id]').forEach((el) => els.set(el.dataset.id, el));
-    const visible = (id) => {
-      const el = els.get(id);
-      return el && !el.classList.contains('hidden') ? el : null;
-    };
+      const els = new Map();
+      wrap.querySelectorAll('.match[data-id]').forEach((el) => els.set(el.dataset.id, el));
+      const visible = (id) => {
+        const el = els.get(id);
+        return el && !el.classList.contains('hidden') ? el : null;
+      };
 
-    const origin = wrap.getBoundingClientRect();
-    const segs = [];
-    const link = (fromId, toId) => {
-      const a = visible(fromId), b = visible(toId);
-      if (!a || !b) return;
-      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-      const x1 = ra.right - origin.left, y1 = ra.top + ra.height / 2 - origin.top;
-      const x2 = rb.left - origin.left, y2 = rb.top + rb.height / 2 - origin.top;
-      if (x2 <= x1) return; // never draw backwards (e.g. a WB loser dropping down)
-      const xm = x1 + (x2 - x1) / 2;
-      segs.push(`M${x1},${y1}H${xm}V${y2}H${x2}`);
-    };
+      const origin = wrap.getBoundingClientRect();
+      const segs = [];
+      const link = (fromId, toId) => {
+        const a = visible(fromId), b = visible(toId);
+        if (!a || !b) return;
+        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+        const x1 = ra.right - origin.left, y1 = ra.top + ra.height / 2 - origin.top;
+        const x2 = rb.left - origin.left, y2 = rb.top + rb.height / 2 - origin.top;
+        if (x2 <= x1) return; // never draw backwards (e.g. a WB loser dropping down)
+        const xm = x1 + (x2 - x1) / 2;
+        segs.push(`M${x1},${y1}H${xm}V${y2}H${x2}`);
+      };
 
-    for (const id of st.order) {
-      const m = st.matches[id];
-      if (m.winnerTo) link(id, m.winnerTo.match);
+      for (const id of st.order) {
+        const m = st.matches[id];
+        if (m.winnerTo) link(id, m.winnerTo.match);
+      }
+      // GF-1 -> GF-2 has no routing entry (it's created on demand), so add it.
+      if (visible('GF-2')) link('GF-1', 'GF-2');
+
+      svg.setAttribute('width', wrap.scrollWidth);
+      svg.setAttribute('height', wrap.scrollHeight);
+      svg.innerHTML = `<path d="${segs.join(' ')}" fill="none" stroke="var(--divider-color, #9e9e9e)" stroke-width="2" stroke-linejoin="round"/>`;
     }
-    // GF-1 -> GF-2 has no routing entry (it's created on demand), so add it.
-    if (visible('GF-2')) link('GF-1', 'GF-2');
+  }
 
-    svg.setAttribute('width', wrap.scrollWidth);
-    svg.setAttribute('height', wrap.scrollHeight);
-    svg.innerHTML = `<path d="${segs.join(' ')}" fill="none" stroke="var(--divider-color, #9e9e9e)" stroke-width="2" stroke-linejoin="round"/>`;
+  /* ----- round robin / Swiss ----- */
+  _pairedView(decoded, res) {
+    const P = res.players;
+    const isSwiss = res.kind === 'swiss';
+    // Reuse the bracket match markup by converting index pairs to refs.
+    const toRef = (i) => (i == null ? { type: 'bye' } : { type: 'player', seed: i + 1, name: P[i] });
+    const cols = res.rounds.map((r) => `
+      <div class="col">
+        <div class="col-h">Round ${r.round}${isSwiss ? ` of ${res.totalRounds}` : ''}</div>
+        <div class="col-body top">
+          ${r.matches.map((m) => (m.p2 == null
+            ? `<div class="sitout">${esc(P[m.p1])} ${isSwiss ? 'has a bye (win)' : 'sits out'}</div>`
+            : this._matchHtml({ id: m.id, p1: toRef(m.p1), p2: toRef(m.p2), winner: m.winner }))).join('')}
+        </div>
+      </div>`).join('');
+
+    const rows = res.standings.map((s, i) => `
+      <tr><td class="rank">${i + 1}</td><td>${esc(s.name)}</td>
+          <td class="num">${s.wins}–${s.losses}</td>${isSwiss ? `<td class="num muted" title="Strength of opposition">${s.buchholz}</td>` : ''}</tr>`).join('');
+
+    const decider = res.decider ? `
+      <div class="pad">
+        <div class="sub">Decider — tied: ${res.tie.map(esc).join(', ')}</div>
+        ${this._bracketView(res.decider, 'dec', true)}
+      </div>` : '';
+
+    return `
+      <div class="pad grid">
+        <div>
+          <div class="sub">Standings</div>
+          <table><tr class="th"><td></td><td>Player</td><td class="num">W–L</td>${isSwiss ? '<td class="num">SOS</td>' : ''}</tr>${rows}</table>
+        </div>
+        <div class="scroll tight"><div class="cols">${cols}</div></div>
+      </div>
+      ${decider}`;
+  }
+
+  /* ----- king of the hill ----- */
+  _kothView(decoded, res) {
+    const P = res.players;
+    const cur = res.current;
+    const kingStats = res.standings.find((s) => s.idx === res.king) || {};
+    const game = cur ? `
+      <div class="match big" data-id="koth">
+        <div class="mtag">Game ${res.games.length + 1}</div>
+        <div class="p real" data-match="koth" data-side="p1" data-click="1">
+          <span class="nm">👑 ${esc(P[cur.king])}</span><span class="side">${kingStats.kingWins || 0} on top</span>
+        </div>
+        <div class="vs"></div>
+        <div class="p real" data-match="koth" data-side="p2" data-click="1">
+          <span class="nm">${esc(P[cur.challenger])}</span><span class="side">challenger</span>
+        </div>
+      </div>
+      <p class="muted small">Tap the winner. Up next: ${res.queue.slice(1).map((i) => esc(P[i])).join(', ') || '—'}</p>` : '';
+
+    const rows = res.standings.map((s, i) => `
+      <tr><td class="rank">${i + 1}</td><td>${s.idx === res.king && !res.finished ? '👑 ' : ''}${esc(s.name)}</td>
+          <td class="num"><strong>${s.kingWins}</strong></td><td class="num muted">${s.reigns}</td><td class="num muted">${s.wins}–${s.losses}</td></tr>`).join('');
+    const log = [...res.games].reverse().slice(0, 12).map((g) => `
+      <tr><td class="rank">${g.n}</td><td>${g.winner === 'king'
+        ? `👑 <strong>${esc(P[g.king])}</strong> <span class="muted">held off ${esc(P[g.challenger])}</span>`
+        : `<strong>${esc(P[g.challenger])}</strong> <span class="muted">dethroned</span> 👑 ${esc(P[g.king])}`}</td></tr>`).join('');
+
+    return `
+      <div class="pad grid">
+        <div>
+          ${game}
+          <div class="row">
+            ${res.games.length ? `<button class="ghost" id="undo">${res.finished ? 'Reopen' : 'Undo last game'}</button>` : ''}
+            ${!res.finished && res.games.length ? (this._confirmFinish
+              ? `<span class="muted small">End the session and crown the champion?</span><button class="primary" id="do-finish">Yes, finish</button><button class="ghost" id="cancel-finish">Cancel</button>`
+              : `<button class="primary" id="finish">Finish session</button>`) : ''}
+          </div>
+        </div>
+        <div>
+          <div class="sub">Standings</div>
+          <table><tr class="th"><td></td><td>Player</td><td class="num">Wins on top</td><td class="num">Reigns</td><td class="num">W–L</td></tr>${rows}</table>
+          ${res.games.length ? `<div class="sub gap">Games</div><table>${log}</table>` : ''}
+        </div>
+      </div>`;
+  }
+
+  /* ----- free-for-all ----- */
+  _ffaView(decoded, res) {
+    const P = res.players;
+    const order = this._ffaOrder.filter((i) => i < P.length);
+    const chips = P.map((name, i) => {
+      const place = order.indexOf(i);
+      return `<button class="chip${place >= 0 ? ' placed' : ''}" data-ffa="${i}">${place >= 0 ? `<span class="badge">${ordinal(place + 1)}</span>` : ''}${esc(name)}</button>`;
+    }).join('');
+    const entry = res.finished ? '' : `
+      <div class="sub">Round ${res.rounds.length + 1} — tap players in finishing order</div>
+      <div class="chips">${chips}</div>
+      <p class="muted small">Points: ${res.points.slice(0, P.length).join(' · ')}. Anyone not placed scores 0.</p>
+      <div class="row">
+        <button class="primary" id="ffa-save" ${order.length < 2 ? 'disabled' : ''}>Save round</button>
+        ${order.length ? `<button class="ghost" id="ffa-clear">Clear</button>` : ''}
+      </div>`;
+
+    const rows = res.standings.map((s, i) => `
+      <tr><td class="rank">${i + 1}</td><td>${esc(s.name)}</td>
+          <td class="num"><strong>${s.points}</strong></td><td class="num muted">${s.places[0]}</td><td class="num muted">${s.rounds}</td></tr>`).join('');
+    const log = [...res.rounds].reverse().slice(0, 12).map((r) => `
+      <tr><td class="rank">${r.n}</td><td>${r.order.map((i, k) => (k === 0 ? `<strong>${esc(P[i])}</strong>` : esc(P[i]))).join(', ')}</td></tr>`).join('');
+
+    return `
+      <div class="pad grid">
+        <div>
+          ${entry}
+          <div class="row">
+            ${res.rounds.length ? `<button class="ghost" id="undo">${res.finished ? 'Reopen' : 'Undo last round'}</button>` : ''}
+            ${!res.finished && res.rounds.length ? (this._confirmFinish
+              ? `<span class="muted small">End the session and crown the champion?</span><button class="primary" id="do-finish" ${res.tie ? 'disabled' : ''}>Yes, finish</button><button class="ghost" id="cancel-finish">Cancel</button>`
+              : `<button class="primary" id="finish" ${res.tie ? 'disabled title="Tied at the top — play another round"' : ''}>Finish</button>`) : ''}
+          </div>
+        </div>
+        <div>
+          <div class="sub">Standings</div>
+          <table><tr class="th"><td></td><td>Player</td><td class="num">Pts</td><td class="num">1sts</td><td class="num">Rounds</td></tr>${rows}</table>
+          ${res.rounds.length ? `<div class="sub gap">Rounds</div><table>${log}</table>` : ''}
+        </div>
+      </div>`;
   }
 
   _wire(decoded) {
     const $ = (sel) => this.shadowRoot.querySelector(sel);
-    const newBtn = $('#new');
-    if (newBtn) newBtn.onclick = () => { this._confirmReset = true; this._render(); };
-    const doReset = $('#do-reset');
-    if (doReset) doReset.onclick = () => this._clear();
-    const cancel = $('#cancel-reset');
-    if (cancel) cancel.onclick = () => { this._confirmReset = false; this._render(); };
+    const on = (sel, fn) => { const el = $(sel); if (el) el.onclick = fn; };
+    on('#new', () => { this._confirmReset = true; this._render(); });
+    on('#do-reset', () => this._clear());
+    on('#cancel-reset', () => { this._confirmReset = false; this._render(); });
 
     const draft = $('#draft');
     if (draft) draft.oninput = (e) => { this._draft = e.target.value; };
     const game = $('#game');
     if (game) game.oninput = (e) => { this._game = e.target.value; };
-    const retry = $('#retry');
-    if (retry) retry.onclick = () => {
-      const c = this._state && champion(this._state);
-      if (c) this._recordResult(c);
-    };
-    const create = $('#create');
-    if (create) create.onclick = () => this._createFromDraft();
+    const mode = $('#mode');
+    if (mode) mode.onchange = (e) => { this._mode = e.target.value; this._render(); };
+    const rounds = $('#rounds');
+    if (rounds) rounds.oninput = (e) => { this._swissRounds = e.target.value; };
+    on('#create', () => this._createFromDraft());
+
+    on('#retry', () => { if (this._result && this._result.champion) this._recordResult(this._result); });
+    on('#undo', () => this._undo());
+    on('#finish', () => { this._confirmFinish = true; this._render(); });
+    on('#cancel-finish', () => { this._confirmFinish = false; this._render(); });
+    on('#do-finish', () => this._finish());
+    on('#ffa-save', () => this._saveFfaRound());
+    on('#ffa-clear', () => { this._ffaOrder = []; this._render(); });
+    this.shadowRoot.querySelectorAll('[data-ffa]').forEach((el) => {
+      el.onclick = () => {
+        const i = Number(el.getAttribute('data-ffa'));
+        const at = this._ffaOrder.indexOf(i);
+        if (at >= 0) this._ffaOrder.splice(at, 1); else this._ffaOrder.push(i);
+        this._render();
+      };
+    });
 
     this.shadowRoot.querySelectorAll('[data-click="1"]').forEach((el) => {
       el.onclick = () => this._pick(el.getAttribute('data-match'), el.getAttribute('data-side'));
@@ -984,10 +1629,11 @@ class BracketCard extends HTMLElement {
 }
 
 function roundName(cls, r, total) {
-  if (cls === 'wb') {
-    if (r === total) return 'WB Final';
-    if (r === total - 1) return 'WB Semis';
-    return 'WB R' + r;
+  if (cls === 'wb' || cls === 'se') {
+    const pre = cls === 'wb' ? 'WB ' : '';
+    if (r === total) return pre + 'Final';
+    if (r === total - 1) return pre + 'Semis';
+    return pre + 'R' + r;
   }
   if (cls === 'lb') {
     if (r === total) return 'LB Final';
@@ -1006,14 +1652,16 @@ const STYLE = `
   :host { display:block; }
   ha-card { padding: 0 0 4px; overflow: hidden; }
   .hdr { display:flex; align-items:center; justify-content:space-between;
-         padding: 14px 16px 6px; }
+         padding: 14px 16px 6px; gap: 8px; }
   .title { font-size: 1.25rem; font-weight: 600; color: var(--primary-text-color);
-           display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-  .game { font-size:.8rem; font-weight:600; padding: 2px 10px; border-radius: 999px;
+           display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .pill { font-size:.8rem; font-weight:600; padding: 2px 10px; border-radius: 999px;
           background: var(--secondary-background-color); color: var(--secondary-text-color); }
+  .pill.mode { font-weight:500; opacity:.85; }
   .lbl { display:block; font-size:.8rem; font-weight:600; margin: 8px 0 4px;
          color: var(--secondary-text-color); }
-  input[type=text] { width:100%; box-sizing:border-box; font: inherit; padding:10px;
+  input[type=text], input[type=number], select {
+             width:100%; box-sizing:border-box; font: inherit; padding:10px;
              border:1px solid var(--divider-color, #e0e0e0); border-radius:8px;
              background: var(--card-background-color); color: var(--primary-text-color); }
   .tnote { font-size:.8rem; font-weight:400; margin-left: 12px; opacity:.9; }
@@ -1021,6 +1669,7 @@ const STYLE = `
   .ghost.small { padding: 2px 10px; font-size:.8rem; margin-left: 8px; }
   .pad { padding: 8px 16px 16px; }
   .muted { color: var(--secondary-text-color); }
+  .small { font-size:.85rem; margin: 4px 0 6px; }
   .err { color: var(--error-color, #db4437); }
   .foot { text-align:right; font-size: 10px; color: var(--disabled-text-color, #9e9e9e);
           padding: 2px 12px 2px; opacity:.7; }
@@ -1028,9 +1677,10 @@ const STYLE = `
              border:1px solid var(--divider-color, #e0e0e0); border-radius:8px;
              background: var(--card-background-color); color: var(--primary-text-color);
              resize: vertical; }
-  .row { margin-top:10px; display:flex; gap:8px; }
+  .row { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   button { font: inherit; cursor:pointer; border-radius: 999px; border: none;
            padding: 8px 16px; }
+  button[disabled] { opacity:.5; cursor:default; }
   .primary { background: var(--primary-color); color: var(--text-primary-color, #fff); }
   .ghost { background: transparent; color: var(--primary-color);
            border: 1px solid var(--divider-color, #e0e0e0); padding: 6px 12px; }
@@ -1045,7 +1695,10 @@ const STYLE = `
            background: linear-gradient(90deg, var(--primary-color), transparent);
            color: var(--text-primary-color, #fff); font-size: 1.05rem; }
   .champ strong { font-weight: 700; }
+  .tie { margin: 4px 16px 8px; padding: 8px 14px; border-radius: 10px; font-size:.95rem;
+         background: var(--secondary-background-color); color: var(--primary-text-color); }
   .scroll { overflow-x: auto; padding: 4px 12px 12px; }
+  .scroll.tight { padding: 0; }
   /* Layout: winners + losers stacked on the left, grand final centred on the
      right. Columns stretch to full height and space their matches evenly so
      each later round sits centred between the matches feeding it. */
@@ -1065,11 +1718,13 @@ const STYLE = `
            text-align:center; min-height: 1em; font-weight:600; margin-bottom: 4px; }
   .col-body { flex:1; display:flex; flex-direction:column; justify-content:space-around;
               gap: 12px; }
+  .col-body.top { justify-content:flex-start; }
   .gf-col { display:flex; flex-direction:column; min-width: 132px; }
   .gf-body { flex:1; display:flex; flex-direction:column; justify-content:center; gap: 12px; }
   .match.hidden { visibility: hidden; }
   .match { position: relative; z-index: 1; border:1px solid var(--divider-color, #e0e0e0);
            border-radius: 8px; overflow: hidden; background: var(--card-background-color); }
+  .match.big .p { padding: 12px 14px; font-size: 1.05rem; }
   .mtag { font-size:.6rem; text-transform:uppercase; letter-spacing:.06em;
           text-align:center; padding:2px; color: var(--secondary-text-color);
           background: var(--secondary-background-color); }
@@ -1077,6 +1732,7 @@ const STYLE = `
        padding: 8px 10px; font-size:.92rem; gap:6px;
        color: var(--primary-text-color); user-select:none; }
   .p .nm { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .p .side { font-size:.75rem; color: var(--secondary-text-color); white-space:nowrap; }
   .p.empty .nm { color: var(--disabled-text-color, #9e9e9e); font-style:italic; }
   .p[data-click="1"] { cursor:pointer; }
   .p[data-click="1"]:hover { background: var(--secondary-background-color); }
@@ -1085,6 +1741,31 @@ const STYLE = `
   .p.win .chk { color: var(--primary-color); font-weight:700; }
   .p.lose .nm { color: var(--disabled-text-color, #9e9e9e); text-decoration: line-through; }
   .vs { height:1px; background: var(--divider-color, #e0e0e0); margin: 0 8px; }
+  .sitout { font-size:.8rem; color: var(--secondary-text-color); font-style:italic;
+            padding: 6px 4px; }
+  /* tables + two-column layouts (standings / rounds, history) */
+  .grid { display:grid; grid-template-columns: minmax(200px, 1fr) 2fr; gap: 16px; }
+  @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
+  .sub { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; font-weight:700;
+         margin-bottom: 6px; color: var(--secondary-text-color); }
+  .sub.gap { margin-top: 14px; }
+  table { border-collapse: collapse; width:100%; font-size:.92rem; color: var(--primary-text-color); }
+  td { padding: 6px 6px; border-bottom: 1px solid var(--divider-color, #e0e0e0); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr.th td { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em;
+             color: var(--disabled-text-color, #9e9e9e); font-weight:600; }
+  .rank { color: var(--disabled-text-color, #9e9e9e); width: 1.5em; }
+  .num { text-align:right; white-space:nowrap; }
+  .nowrap { white-space:nowrap; }
+  /* free-for-all entry */
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { background: var(--secondary-background-color); color: var(--primary-text-color);
+          border: 1px solid var(--divider-color, #e0e0e0); padding: 8px 14px;
+          display:flex; align-items:center; gap:8px; }
+  .chip.placed { background: color-mix(in srgb, var(--primary-color) 16%, var(--card-background-color));
+                 border-color: var(--primary-color); font-weight:600; }
+  .badge { font-size:.7rem; font-weight:700; padding: 1px 6px; border-radius: 999px;
+           background: var(--primary-color); color: var(--text-primary-color, #fff); }
 `;
 
 /* ---------- history card ---------- */
@@ -1139,7 +1820,7 @@ class BracketHistoryCard extends HTMLElement {
     this._busy = true; this._error = null;
     this._render();
     const limit = Math.max(1, Math.min(1000, Number(this._config.limit) || 100));
-    const q = `SELECT "winner", "runner_up", "players", "player_count", "game" FROM "${this._tracking.measurement}" ORDER BY time DESC LIMIT ${limit}`;
+    const q = `SELECT "winner", "runner_up", "players", "player_count", "standings", "top_wins", "game", "mode" FROM "${this._tracking.measurement}" ORDER BY time DESC LIMIT ${limit}`;
     try {
       const r = await callWithResponse(this._hass, this._tracking.query_service, { q });
       this._rows = parseInfluxRows(r && r.content != null ? r.content : r);
@@ -1182,7 +1863,7 @@ class BracketHistoryCard extends HTMLElement {
 
   _historyView() {
     const all = this._rows;
-    if (!all.length) return `<div class="pad muted">No results recorded yet. Finish a bracket with tracking on and it will show up here.</div>`;
+    if (!all.length) return `<div class="pad muted">No results recorded yet. Finish a tournament with tracking on and it will show up here.</div>`;
     const games = [...new Set(all.map((r) => r.game || 'Untitled'))].sort();
     const rows = this._filter ? all.filter((r) => (r.game || 'Untitled') === this._filter) : all;
     const latest = rows[0];
@@ -1197,9 +1878,15 @@ class BracketHistoryCard extends HTMLElement {
         ${games.map((g) => `<option value="${esc(g)}" ${g === this._filter ? 'selected' : ''}>${esc(g)}</option>`).join('')}
       </select>` : '';
 
+    const detail = (r) => {
+      if (r.mode === 'king_of_the_hill') {
+        return `<span class="muted"> — ${Number.isFinite(r.top_wins) ? `${r.top_wins} wins on top` : 'king of the hill'}</span>`;
+      }
+      return r.runner_up ? `<span class="muted"> beat ${esc(r.runner_up)}</span>` : '';
+    };
     const champ = latest ? `
       <div class="champ">🏆 Current champion:&nbsp;<strong>${esc(latest.winner)}</strong>
-        <span class="tnote">${esc(latest.game || 'Untitled')} · ${esc(fmtDate(latest.time))}</span>
+        <span class="tnote">${esc(latest.game || 'Untitled')}${latest.mode ? ` · ${esc(modeLabelFromTag(latest.mode))}` : ''} · ${esc(fmtDate(latest.time))}</span>
       </div>` : `<div class="pad muted">No results for this game yet.</div>`;
 
     return `
@@ -1215,7 +1902,11 @@ class BracketHistoryCard extends HTMLElement {
         <div>
           <div class="sub">Results</div>
           <table>
-            ${rows.map((r) => `<tr><td class="muted nowrap">${esc(fmtDate(r.time))}</td><td>${esc(r.game || 'Untitled')}</td><td><strong>${esc(r.winner)}</strong>${r.runner_up ? `<span class="muted"> beat ${esc(r.runner_up)}</span>` : ''}</td></tr>`).join('')}
+            ${rows.map((r) => `<tr><td class="muted nowrap">${esc(fmtDate(r.time))}</td>
+              <td>${esc(r.game || 'Untitled')}${r.mode ? `<div class="muted tiny">${esc(modeLabelFromTag(r.mode))}</div>` : ''}</td>
+              <td><strong>${esc(r.winner)}</strong>${detail(r)}
+                  ${r.players ? `<div class="muted tiny">Players: ${esc(r.players)}</div>` : ''}
+                  ${r.standings ? `<div class="muted tiny">${esc(r.standings)}</div>` : ''}</td></tr>`).join('')}
           </table>
         </div>
       </div>`;
@@ -1225,19 +1916,8 @@ class BracketHistoryCard extends HTMLElement {
 const HISTORY_STYLE = `
   .top { padding-bottom: 0; }
   .top:empty { display:none; }
-  select { font: inherit; padding: 6px 10px; border-radius: 8px;
-           border:1px solid var(--divider-color, #e0e0e0);
-           background: var(--card-background-color); color: var(--primary-text-color); }
-  .grid { display:grid; grid-template-columns: minmax(160px, 1fr) 2fr; gap: 16px; }
-  @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } }
-  .sub { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; font-weight:700;
-         margin-bottom: 6px; color: var(--secondary-text-color); }
-  table { border-collapse: collapse; width:100%; font-size:.92rem; color: var(--primary-text-color); }
-  td { padding: 6px 6px; border-bottom: 1px solid var(--divider-color, #e0e0e0); vertical-align: top; }
-  tr:last-child td { border-bottom: none; }
-  .rank { color: var(--disabled-text-color, #9e9e9e); width: 1.5em; }
-  .num { text-align:right; white-space:nowrap; }
-  .nowrap { white-space:nowrap; }
+  select { width:auto; padding: 6px 10px; }
+  .tiny { font-size:.75rem; }
 `;
 
 if (!customElements.get('bracket-card')) {
@@ -1252,11 +1932,11 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'bracket-card',
   name: 'Bracket Card',
-  description: 'Reusable double-elimination tournament bracket for game night.',
+  description: 'Game-night tournaments: double/single elimination, round robin, Swiss, king of the hill, free-for-all.',
 }, {
   type: 'bracket-history-card',
   name: 'Bracket History Card',
-  description: 'Current champion, past winners and leaderboard from recorded bracket results.',
+  description: 'Current champion, past winners and leaderboard from recorded results.',
 });
 
 console.info(

@@ -152,6 +152,22 @@ section('resetBracket=false');
   assert(champion(s) != null, 'champion decided with reset disabled');
 }
 
+// ---- single elimination ----
+section('single elimination');
+{
+  for (const n of [2, 3, 5, 8]) {
+    const names = Array.from({ length: n }, (_, i) => 'P' + (i + 1));
+    const s0 = generateBracket(names, { single: true });
+    assert(s0.single === true && s0.resetBracket === false, `n=${n}: single flag set`);
+    assert(s0.order.every((id) => id.startsWith('W')), `n=${n}: only winners-bracket matches`);
+    assert(champion(s0) === null || n === 1, `n=${n}: no champion before play`);
+    const s = playOut(s0, favouriteLower);
+    const c = champion(s);
+    assert(c && c.name === 'P1', `n=${n}: favourite wins single-elim (got ${c && c.name})`);
+    assert(c.runnerUp && c.runnerUp !== 'P1', `n=${n}: runner-up reported`);
+  }
+}
+
 // ---- idempotent resolve ----
 section('resolve idempotency');
 {

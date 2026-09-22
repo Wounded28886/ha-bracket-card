@@ -81,7 +81,8 @@ export function generateBracket(players, opts = {}) {
   }
   const size = nextPow2(names.length);
   const W = wbRounds(size);
-  const resetBracket = opts.resetBracket !== false;
+  const single = opts.single === true;
+  const resetBracket = !single && opts.resetBracket !== false;
 
   const matches = {};
   const order = [];
@@ -119,6 +120,14 @@ export function generateBracket(players, opts = {}) {
     wb[r - 1].forEach((id, i) => {
       const target = wb[r][Math.floor(i / 2)];
       matches[id].winnerTo = { match: target, slot: i % 2 === 0 ? 'p1' : 'p2' };
+    });
+  }
+
+  // Single elimination: the winners bracket is the whole tournament.
+  if (single) {
+    return resolve({
+      version: 2, createdAt: new Date().toISOString(), size,
+      single: true, resetBracket: false, players: names, matches, order,
     });
   }
 
@@ -218,6 +227,7 @@ export function generateBracket(players, opts = {}) {
     version: 2,
     createdAt: new Date().toISOString(),
     size,
+    single: false,
     resetBracket,
     players: names,
     matches,
@@ -384,6 +394,10 @@ export function champion(state) {
     if (!isPlayer(win)) return null;
     return { name: win.name, runnerUp: isPlayer(lose) ? lose.name : null };
   };
+  if (state.single) {
+    const final = m[`W${Math.log2(state.size)}-1`];
+    return final && final.winner && final.winner !== 'bye' ? decided(final) : null;
+  }
   const gf2 = m['GF-2'];
   if (gf2 && gf2.winner && gf2.winner !== 'bye') return decided(gf2);
   const gf1 = m['GF-1'];
