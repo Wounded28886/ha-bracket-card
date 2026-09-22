@@ -37,10 +37,10 @@ import {
 } from './bracket.js';
 import {
   roundRobin, swiss, kingOfTheHill, freeForAll, encodeFfaRound, standingsSummary,
-  kothChallengerCode, KOTH_MAX_PLAYERS, kothSnapshot,
+  kothChallengerCode, KOTH_MAX_PLAYERS, kothSnapshot, kothRebase,
 } from './formats.js';
 
-const CARD_VERSION = '1.4.0';
+const CARD_VERSION = '1.5.0';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.
@@ -54,7 +54,7 @@ const MODES = {
   w: { label: 'Swiss system', tag: 'swiss',
        help: 'A fixed number of rounds; each round you play someone on the same record. Nobody is knocked out.' },
   k: { label: 'King of the hill', tag: 'king_of_the_hill',
-       help: 'Winner stays on. Whoever holds the hill is the champion; wins on top are tracked. Sessions can be picked up again later.' },
+       help: 'Nobody starts as king — the first game crowns one, then the winner stays on. Each game keeps one ongoing title you can carry on later.' },
   f: { label: 'Free-for-all', tag: 'free_for_all',
        help: 'Everyone plays at once (a race, a hand). Enter each round\u2019s finishing order; points decide it.' },
 };
@@ -77,7 +77,8 @@ function modeChar(v) {
 // orders for free-for-all. `m` mode (default double elim), `d` decider
 // decisions for a tied round robin / Swiss, `f` finished (koth / ffa),
 // `k` Swiss round count, `g` game, `c` created (epoch s), `r` recorded,
-// `b` king-of-the-hill carry-over from an earlier session (see kothSnapshot).
+// `b` king-of-the-hill carry-over from an earlier session (see kothSnapshot),
+// `t` this king-of-the-hill game is a one-off that doesn't touch the lineage.
 // All but p/w are optional so brackets stored by older versions still decode.
 
 function bracketOpts(d) {
@@ -114,6 +115,7 @@ function encodeState(d) {
   if (d.finished) out.f = 1;
   if (d.swissRounds) out.k = d.swissRounds;
   if (d.base) out.b = d.base;
+  if (d.temp) out.t = 1;
   if (d.game) out.g = d.game;
   if (d.created) out.c = d.created;
   if (d.recorded) out.r = 1;
@@ -136,6 +138,7 @@ function decodeState(raw) {
     finished: obj.f === 1,
     swissRounds: Number.isInteger(obj.k) && obj.k > 0 ? obj.k : 0,
     base: obj.b && typeof obj.b === 'object' ? obj.b : null,
+    temp: obj.t === 1,
     game: typeof obj.g === 'string' ? obj.g : '',
     created: Number.isFinite(obj.c) ? obj.c : 0,
     recorded: obj.r === 1,
@@ -254,7 +257,7 @@ function trackingConfig(config) {
 const lpTag = (v) => String(v).replace(/[,= \\]/g, (c) => '\\' + c);
 const lpStr = (v) => '"' + String(v).replace(/[\\"]/g, (c) => '\\' + c) + '"';
 
-function resultLine(measurement, { game, mode, winner, runnerUp, players, created, standings, topWins, snapshot, sessions, games }) {
+function resultLine(measurement, { game, mode, winner, runnerUp, players, created, standings, topWins, snapshot, sessions, games, temp }) {
   const tags = `game=${lpTag(game || 'Untitled')},mode=${lpTag(MODES[mode].tag)}`;
   const fields = [
     `winner=${lpStr(winner)}`,
@@ -265,6 +268,9 @@ function resultLine(measurement, { game, mode, winner, runnerUp, players, create
   if (standings) fields.push(`standings=${lpStr(standings)}`);
   if (Number.isInteger(topWins)) fields.push(`top_wins=${topWins}i`);
   // King of the hill lineages carry enough to be picked up again later.
+  // A one-off game is flagged and carries no snapshot, so it is never
+  // mistaken for the game's ongoing lineage.
+  if (temp) fields.push('temp=true');
   if (snapshot) {
     fields.push(`state=${lpStr(JSON.stringify({ p: players, b: snapshot }))}`);
     fields.push(`sessions=${sessions}i`, `games=${games}i`, `last_played=${Math.floor(Date.now() / 1000)}i`);
@@ -337,6 +343,7 @@ class BracketCard extends HTMLElement {
     this._swissRounds = ''; // setup rounds input (Swiss), '' = automatic
     this._ffaOrder = [];    // free-for-all: finishing order being entered
     this._kothChallenger = null; // king of the hill: hand-picked next challenger
+    this._pending = null;   // setup prompt: continue a lineage / confirm the roster
     this._confirmReset = false;
     this._confirmFinish = false;
     this._track = { busy: false, error: null };
@@ -397,13 +404,15 @@ class BracketCard extends HTMLElement {
   _clear() {
     this._confirmReset = false;
     this._ffaOrder = [];
+    this._pending = null;
+    this._kothSessions = undefined;   // re-read the lineages on the way back to setup
     this._lastRaw = '';
     this._setValue('');
     this._render();
   }
 
   /* --- actions --- */
-  _createFromDraft() {
+  async _createFromDraft() {
     const names = this._draft.split('\n').map((n) => n.trim()).filter(Boolean);
     if (names.length < 2) { this._flash('Enter at least two players (one per line).'); return; }
     if (names.length > 64) { this._flash('That is a lot of players — cap is 64.'); return; }
@@ -412,17 +421,75 @@ class BracketCard extends HTMLElement {
     // Entry order is seeding order, and a typed list is rarely random — so
     // shuffle once here. The shuffled order is what gets stored, so the
     // draw is stable from then on.
+    const game = this._game.trim();
+    // King of the hill: each game keeps one ongoing lineage. If its reigning
+    // champion is in tonight's list, offer to carry it on; otherwise this is
+    // a one-off that leaves the title where it is.
+    if (this._mode === 'k' && this._tracking) {
+      if (this._kothSessions === undefined || this._kothSessions === 'loading') await this._loadKothSessions();
+      const lineage = this._lineageFor(game);
+      if (lineage) {
+        const playing = names.some((n) => n.toLowerCase() === String(lineage.king).toLowerCase());
+        if (playing) {
+          this._pending = { kind: 'continue', names, lineage };
+          this._render();
+          return;
+        }
+        shuffle(names);
+        this._startKoth(names, { game, temp: true });
+        return;
+      }
+    }
     shuffle(names);
     const swissRounds = this._mode === 'w' ? Math.max(0, parseInt(this._swissRounds, 10) || 0) : 0;
-    this._track = { busy: false, error: null };
     this._ffaOrder = [];
+    if (this._mode === 'k') { this._startKoth(names, { game }); return; }
+    this._track = { busy: false, error: null };
     this._kothChallenger = null;
     this._save({
       players: names, mode: this._mode, w: '', decisions: {},
       resetBracket: this._config.reset_bracket !== false,
-      decider: '', finished: false, swissRounds, base: null,
-      game: this._game.trim(), created: Math.floor(Date.now() / 1000), recorded: false,
+      decider: '', finished: false, swissRounds, base: null, temp: false,
+      game, created: Math.floor(Date.now() / 1000), recorded: false,
     });
+  }
+
+  // Step 2 of the continue flow: confirm who is playing tonight. Returning
+  // players keep the lineage's spelling; the champion can't be dropped.
+  _openRoster() {
+    const p = this._pending;
+    if (!p || p.kind !== 'continue') return;
+    const order = [...p.lineage.players];
+    const selected = new Set();
+    for (const name of p.names) {
+      const known = order.find((n) => n.toLowerCase() === name.toLowerCase());
+      if (known) selected.add(known);
+      else { order.push(name); selected.add(name); }
+    }
+    selected.add(p.lineage.king);
+    this._pending = { kind: 'roster', lineage: p.lineage, order, selected };
+    this._render();
+  }
+
+  _toggleRoster(name) {
+    const p = this._pending;
+    if (!p || p.kind !== 'roster') return;
+    if (name === p.lineage.king) return;   // the champion is what's being continued
+    if (p.selected.has(name)) p.selected.delete(name); else p.selected.add(name);
+    this._render();
+  }
+
+  _addRosterName() {
+    const p = this._pending;
+    const input = this.shadowRoot.querySelector('#roster-add');
+    if (!p || p.kind !== 'roster' || !input) return;
+    const name = input.value.trim();
+    if (!name) return;
+    const known = p.order.find((n) => n.toLowerCase() === name.toLowerCase());
+    if (known) p.selected.add(known);
+    else { p.order.push(name); p.selected.add(name); }
+    input.value = '';
+    this._render();
   }
 
   // Tap handler for every format. matchId is a bracket match id, "dec:<id>"
@@ -526,7 +593,8 @@ class BracketCard extends HTMLElement {
       game: d.game, mode: d.mode, winner: champ.name, runnerUp: champ.runnerUp,
       players: d.players, created: d.created || Math.floor(Date.now() / 1000),
       standings: standingsSummary(res), topWins: koth ? res.kingWins : undefined,
-      snapshot: koth ? kothSnapshot(res) : null, sessions: res.sessions, games: res.totalGames,
+      snapshot: koth && !d.temp ? kothSnapshot(res) : null, sessions: res.sessions,
+      games: res.totalGames, temp: koth && d.temp,
     });
     try {
       await callWithResponse(this._hass, this._tracking.write_service, { line });
@@ -560,13 +628,14 @@ class BracketCard extends HTMLElement {
   async _loadKothSessions() {
     if (!this._tracking || !this._hass) return;
     this._kothSessions = 'loading';
-    const q = `SELECT "state", "winner", "top_wins", "games", "sessions", "last_played", "game" FROM "${this._tracking.measurement}" WHERE "mode" = 'king_of_the_hill' ORDER BY time DESC LIMIT 100`;
+    const q = `SELECT "state", "winner", "top_wins", "games", "sessions", "last_played", "temp", "game" FROM "${this._tracking.measurement}" WHERE "mode" = 'king_of_the_hill' ORDER BY time DESC LIMIT 100`;
     try {
       const r = await callWithResponse(this._hass, this._tracking.query_service, { q });
       const rows = parseInfluxRows(r && r.content != null ? r.content : r);
       const seen = new Set();
       const out = [];
       for (const row of rows) {
+        if (row.temp === true) continue;        // one-off games never become the lineage
         const game = row.game || 'Untitled';
         if (seen.has(game)) continue;   // rows are newest first: keep the latest lineage per game
         seen.add(game);
@@ -583,17 +652,40 @@ class BracketCard extends HTMLElement {
     this._render();
   }
 
-  _resumeKoth(session) {
+  // The ongoing lineage for a game name, if one has been recorded.
+  _lineageFor(game) {
+    const list = Array.isArray(this._kothSessions) ? this._kothSessions : [];
+    const want = String(game || '').trim().toLowerCase();
+    return list.find((x) => String(x.game).toLowerCase() === want) || null;
+  }
+
+  // Start (or continue) a king-of-the-hill game.
+  //   lineage + base -> carries the game's ongoing lineage on
+  //   temp           -> a one-off that leaves the lineage alone
+  _startKoth(players, { game, base = null, created = 0, temp = false }) {
     this._track = { busy: false, error: null };
     this._kothChallenger = null;
+    this._pending = null;
     this._save({
-      players: session.players, mode: 'k', w: '', decisions: {},
+      players, mode: 'k', w: '', decisions: {},
       resetBracket: this._config.reset_bracket !== false,
-      decider: '', finished: false, swissRounds: 0, base: session.base,
-      // Same creation time as the lineage's point, so the next record updates
-      // it instead of starting a second history entry.
-      game: session.game, created: session.time, recorded: false,
+      decider: '', finished: false, swissRounds: 0, base, temp,
+      // Continuing reuses the lineage's timestamp, so recording updates that
+      // same point instead of starting a second history entry.
+      game, created: created || Math.floor(Date.now() / 1000), recorded: false,
     });
+  }
+
+  // Roster step: build the final player list and re-map the lineage onto it.
+  _continueLineage() {
+    const p = this._pending;
+    if (!p || p.kind !== 'roster') return;
+    const players = p.order.filter((n) => p.selected.has(n));
+    if (players.length < 2) { this._flash('Keep at least two players.'); return; }
+    if (players.length > KOTH_MAX_PLAYERS) { this._flash(`King of the hill supports up to ${KOTH_MAX_PLAYERS} players.`); return; }
+    const base = kothRebase(p.lineage.base, p.lineage.players, players);
+    if (!base) { this._flash(`${p.lineage.king} holds this hill and has to be playing to continue it.`); return; }
+    this._startKoth(players, { game: p.lineage.game, base, created: p.lineage.time });
   }
 
   _flash(msg) {
@@ -617,7 +709,7 @@ class BracketCard extends HTMLElement {
     } else if (!this._hass.states[this._config.entity]) {
       body = `<div class="pad err">Helper <code>${esc(this._config.entity)}</code> not found. Create the input_text helper first.</div>`;
     } else if (!decoded) {
-      body = this._setupView();
+      body = this._pending ? this._pendingView() : this._setupView();
     } else {
       const res = compute(decoded, this._config);
       this._result = res;
@@ -633,7 +725,8 @@ class BracketCard extends HTMLElement {
         <div class="hdr">
           <div class="title">${esc(title)}${decoded && decoded.game
             ? `<span class="pill">${esc(decoded.game)}</span>` : ``}${decoded
-            ? `<span class="pill mode">${esc(MODES[decoded.mode].label)}</span>` : ``}</div>
+            ? `<span class="pill mode">${esc(MODES[decoded.mode].label)}</span>` : ``}${decoded && decoded.temp
+            ? `<span class="pill temp" title="A one-off game — the ongoing title is untouched">one-off</span>` : ``}</div>
           ${decoded ? `<button class="ghost" id="new">New game</button>` : ``}
         </div>
         ${this._msg ? `<div class="flash">${esc(this._msg)}</div>` : ``}
@@ -683,24 +776,22 @@ class BracketCard extends HTMLElement {
   _setupView() {
     const modeOpts = Object.entries(MODES).map(([k, m]) =>
       `<option value="${k}" ${k === this._mode ? 'selected' : ''}>${esc(m.label)}</option>`).join('');
-    let resume = '';
+    // King of the hill keeps one ongoing lineage per game. Say where it
+    // stands, so it's clear what happens when Start is pressed.
+    let lineageNote = '';
     if (this._mode === 'k' && this._tracking) {
       if (this._kothSessions === undefined) { this._kothSessions = 'loading'; setTimeout(() => this._loadKothSessions(), 0); }
       const ks = this._kothSessions;
-      if (ks === 'loading') resume = `<p class="muted small">Looking for previous sessions…</p>`;
-      else if (ks && ks.error) resume = `<p class="err small">Couldn't load previous sessions: ${esc(ks.error)}</p>`;
+      if (ks === 'loading') lineageNote = `<p class="muted small">Checking for an existing king…</p>`;
+      else if (ks && ks.error) lineageNote = `<p class="err small">Couldn't check for an existing king: ${esc(ks.error)}</p>`;
       else if (Array.isArray(ks) && ks.length) {
-        const typed = this._game.trim().toLowerCase();
-        const sorted = [...ks].sort((a, b) => (b.game.toLowerCase() === typed) - (a.game.toLowerCase() === typed) || b.lastPlayed - a.lastPlayed);
-        resume = `
-          <div class="sub gap">Continue a previous session</div>
-          <div class="resume">${sorted.map((x) => `
-            <div class="rrow${x.game.toLowerCase() === typed ? ' hit' : ''}">
-              <div><strong>${esc(x.game)}</strong> <span class="muted">— 👑 ${esc(x.king)}${Number.isFinite(x.topWins) ? ` (${x.topWins} on top)` : ''}, ${x.games || '?'} games, last played ${esc(fmtDate(x.lastPlayed))}</span>
-                <div class="muted tiny">${esc(x.players.join(', '))}</div></div>
-              <button class="ghost" data-resume="${ks.indexOf(x)}">Continue</button>
-            </div>`).join('')}</div>
-          <p class="muted small">Or start a fresh one below — the previous session stays in the history.</p>`;
+        const hit = this._lineageFor(this._game);
+        lineageNote = hit ? `
+          <div class="lineage">
+            <div>👑 <strong>${esc(hit.king)}</strong> holds the ${esc(hit.game)} hill${Number.isFinite(hit.topWins) ? ` — ${hit.topWins} wins on top` : ''}${Number.isFinite(hit.games) ? `, ${hit.games} games` : ''}, last played ${esc(fmtDate(hit.lastPlayed))}.</div>
+            <div class="muted tiny">Include ${esc(hit.king)} in the players to carry that game on; without them it's a one-off and the title stays put.</div>
+          </div>` : `
+          <p class="muted small">No king recorded for this game yet${this._game.trim() ? '' : ' — type the game above to check'}. Ongoing games: ${ks.map((x) => `${esc(x.game)} (👑 ${esc(x.king)})`).join(', ')}.</p>`;
       }
     }
     return `
@@ -710,15 +801,57 @@ class BracketCard extends HTMLElement {
         <label class="lbl" for="mode">Format</label>
         <select id="mode">${modeOpts}</select>
         <p class="muted small">${esc(MODES[this._mode].help)}</p>
-        ${resume}
+        ${lineageNote}
         ${this._mode === 'w' ? `
           <label class="lbl" for="rounds">Rounds</label>
           <input id="rounds" type="number" min="1" max="20" placeholder="automatic (log\u2082 of players)" value="${esc(this._swissRounds)}">` : ''}
         <label class="lbl" for="draft">Players</label>
-        <p class="muted small">One per line. The order is shuffled when you start.</p>
+        <p class="muted small">One per line. ${this._mode === 'k'
+          ? 'The first two play for the hill — the winner is crowned.'
+          : 'The order is shuffled when you start.'}</p>
         <textarea id="draft" rows="8" placeholder="Alice&#10;Bob&#10;Charlie&#10;Dana">${esc(this._draft)}</textarea>
         <div class="row">
           <button class="primary" id="create">Start</button>
+        </div>
+      </div>`;
+  }
+
+  // Start-time prompts for a king-of-the-hill game whose champion is playing.
+  _pendingView() {
+    const p = this._pending;
+    if (!p) return '';
+    if (p.kind === 'continue') {
+      return `
+        <div class="pad">
+          <div class="confirm stack">
+            <div>👑 <strong>${esc(p.lineage.king)}</strong> holds the ${esc(p.lineage.game)} hill${Number.isFinite(p.lineage.games) ? ` (${p.lineage.games} games` : ''}${Number.isFinite(p.lineage.topWins) ? `, ${p.lineage.topWins} wins on top)` : p.lineage.games != null ? ')' : ''} and is playing. Carry that game on?</div>
+            <div class="row">
+              <button class="primary" id="koth-continue">Continue it</button>
+              <button class="ghost" id="koth-oneoff">No — one-off game</button>
+              <button class="ghost" id="koth-cancel">Cancel</button>
+            </div>
+          </div>
+        </div>`;
+    }
+    const rows = p.order.map((name) => {
+      const on = p.selected.has(name);
+      const isKing = name === p.lineage.king;
+      const known = p.lineage.players.includes(name);
+      return `<button class="chip${on ? ' placed' : ''}${isKing ? ' locked' : ''}" data-roster="${esc(name)}"
+        >${isKing ? '👑 ' : ''}${esc(name)}${!known ? '<span class="badge">new</span>' : ''}</button>`;
+    }).join('');
+    return `
+      <div class="pad">
+        <div class="sub">Who's playing? — ${esc(p.lineage.game)}</div>
+        <p class="muted small">Tap to add or drop a player. Returning players keep their record; ${esc(p.lineage.king)} holds the hill and stays.</p>
+        <div class="chips">${rows}</div>
+        <div class="row">
+          <input id="roster-add" type="text" placeholder="Add someone new" maxlength="20">
+          <button class="ghost" id="roster-add-btn">Add</button>
+        </div>
+        <div class="row">
+          <button class="primary" id="roster-go">Continue with ${p.selected.size} player${p.selected.size === 1 ? '' : 's'}</button>
+          <button class="ghost" id="koth-cancel">Cancel</button>
         </div>
       </div>`;
   }
@@ -735,7 +868,7 @@ class BracketCard extends HTMLElement {
     }
     if (champ) {
       const extra = res.kind === 'koth'
-        ? ` <span class="tnote">👑 ${res.kingWins} wins on top · ${res.totalGames} games${res.sessions > 1 ? ` · session ${res.sessions}` : ''}</span>` : '';
+        ? ` <span class="tnote">👑 ${res.kingWins} wins on top · ${res.totalGames} games${res.sessions > 1 ? ` · session ${res.sessions}` : ''}${decoded.temp ? ' · one-off' : ''}</span>` : '';
       return `<div class="champ">🏆 Champion:&nbsp;<strong>${esc(champ.name)}</strong>${extra}${trackNote}</div>`;
     }
     if (res.tie && (res.kind === 'ffa' || res.complete) && !res.decider) {
@@ -919,25 +1052,31 @@ class BracketCard extends HTMLElement {
     const challenger = cur && picked != null && res.queue.includes(picked) ? picked : (cur ? cur.challenger : null);
     const game = cur ? `
       <div class="match big" data-id="koth">
-        <div class="mtag">Game ${res.totalGames + 1}${res.sessions > 1 ? ` · session ${res.sessions}` : ''}</div>
+        <div class="mtag">${cur.crowning ? 'Game 1 — winner takes the hill'
+          : `Game ${res.totalGames + 1}${res.sessions > 1 ? ` · session ${res.sessions}` : ''}`}</div>
         <div class="p real" data-match="koth" data-side="p1" data-click="1">
-          <span class="nm">👑 ${esc(P[cur.king])}</span><span class="side">${kingStats.kingWins || 0} on top</span>
+          <span class="nm">${cur.crowning ? '' : '👑 '}${esc(P[cur.holder])}</span><span class="side">${cur.crowning ? 'on the hill' : `${kingStats.kingWins || 0} on top`}</span>
         </div>
         <div class="vs"></div>
         <div class="p real" data-match="koth" data-side="p2" data-click="1">
           <span class="nm">${esc(P[challenger])}</span><span class="side">challenger</span>
         </div>
       </div>
-      <p class="muted small">Tap the winner above, or pick who challenges next:</p>
+      <p class="muted small">Tap the winner above, or pick who plays next:</p>
       <div class="chips">${res.queue.map((i) => `<button class="chip${i === challenger ? ' placed' : ''}" data-koth="${i}">${esc(P[i])}</button>`).join('')}</div>` : '';
 
     const rows = res.standings.map((s, i) => `
-      <tr><td class="rank">${i + 1}</td><td>${s.idx === res.king && !res.finished ? '👑 ' : ''}${esc(s.name)}</td>
+      <tr><td class="rank">${i + 1}</td><td>${s.idx === res.king ? '👑 ' : ''}${esc(s.name)}</td>
           <td class="num"><strong>${s.kingWins}</strong></td><td class="num muted">${s.reigns}</td><td class="num muted">${s.wins}–${s.losses}</td></tr>`).join('');
-    const log = [...res.games].reverse().slice(0, 12).map((g) => `
-      <tr><td class="rank">${g.n}</td><td>${g.winner === 'king'
-        ? `👑 <strong>${esc(P[g.king])}</strong> <span class="muted">held off ${esc(P[g.challenger])}</span>`
-        : `<strong>${esc(P[g.challenger])}</strong> <span class="muted">dethroned</span> 👑 ${esc(P[g.king])}`}</td></tr>`).join('');
+    const log = [...res.games].reverse().slice(0, 12).map((g) => {
+      const winner = g.winner === 'king' ? P[g.king] : P[g.challenger];
+      const loser = g.winner === 'king' ? P[g.challenger] : P[g.king];
+      return `<tr><td class="rank">${g.n}</td><td>${g.crowning
+        ? `👑 <strong>${esc(winner)}</strong> <span class="muted">took the hill from ${esc(loser)}</span>`
+        : g.winner === 'king'
+          ? `👑 <strong>${esc(winner)}</strong> <span class="muted">held off ${esc(loser)}</span>`
+          : `<strong>${esc(winner)}</strong> <span class="muted">dethroned</span> 👑 ${esc(loser)}`}</td></tr>`;
+    }).join('');
 
     return `
       <div class="pad grid">
@@ -1006,12 +1145,21 @@ class BracketCard extends HTMLElement {
     on('#new', () => { this._confirmReset = true; this._render(); });
     on('#do-reset', () => this._clear());
     on('#do-record-reset', () => this._recordAndClear());
-    this.shadowRoot.querySelectorAll('[data-resume]').forEach((el) => {
-      el.onclick = () => {
-        const list = Array.isArray(this._kothSessions) ? this._kothSessions : [];
-        const sess = list[Number(el.getAttribute('data-resume'))];
-        if (sess) this._resumeKoth(sess);
-      };
+    on('#koth-continue', () => this._openRoster());
+    on('#koth-oneoff', () => {
+      const p = this._pending;
+      if (!p) return;
+      const names = [...p.names];
+      shuffle(names);
+      this._startKoth(names, { game: p.lineage.game, temp: true });
+    });
+    on('#koth-cancel', () => { this._pending = null; this._render(); });
+    on('#roster-go', () => this._continueLineage());
+    on('#roster-add-btn', () => this._addRosterName());
+    const rosterAdd = $('#roster-add');
+    if (rosterAdd) rosterAdd.onkeydown = (e) => { if (e.key === 'Enter') this._addRosterName(); };
+    this.shadowRoot.querySelectorAll('[data-roster]').forEach((el) => {
+      el.onclick = () => this._toggleRoster(el.getAttribute('data-roster'));
     });
     on('#cancel-reset', () => { this._confirmReset = false; this._render(); });
 
@@ -1101,6 +1249,7 @@ const STYLE = `
              background: var(--card-background-color); color: var(--primary-text-color);
              resize: vertical; }
   .row { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .row input[type=text] { width:auto; flex:1 1 160px; min-width:0; }
   button { font: inherit; cursor:pointer; border-radius: 999px; border: none;
            padding: 8px 16px; }
   button[disabled] { opacity:.5; cursor:default; }
@@ -1180,10 +1329,11 @@ const STYLE = `
   .rank { color: var(--disabled-text-color, #9e9e9e); width: 1.5em; }
   .num { text-align:right; white-space:nowrap; }
   .nowrap { white-space:nowrap; }
-  .resume .rrow { display:flex; align-items:center; justify-content:space-between; gap: 10px;
-                  padding: 8px 10px; border: 1px solid var(--divider-color, #e0e0e0);
-                  border-radius: 8px; margin-bottom: 6px; }
-  .resume .rrow.hit { border-color: var(--primary-color); }
+  .lineage { margin: 6px 0 4px; padding: 8px 10px; border-radius: 8px;
+             border: 1px solid var(--primary-color); font-size:.92rem; }
+  .pill.temp { background: var(--warning-color, #ffa600); color: #222; }
+  .confirm.stack { display:block; }
+  .chip.locked { cursor: default; }
   .tiny { font-size:.75rem; }
   /* free-for-all entry */
   .chips { display:flex; flex-wrap:wrap; gap:8px; }
@@ -1248,7 +1398,7 @@ class BracketHistoryCard extends HTMLElement {
     this._busy = true; this._error = null;
     this._render();
     const limit = Math.max(1, Math.min(1000, Number(this._config.limit) || 100));
-    const q = `SELECT "winner", "runner_up", "players", "player_count", "standings", "top_wins", "games", "sessions", "last_played", "game", "mode" FROM "${this._tracking.measurement}" ORDER BY time DESC LIMIT ${limit}`;
+    const q = `SELECT "winner", "runner_up", "players", "player_count", "standings", "top_wins", "games", "sessions", "last_played", "temp", "game", "mode" FROM "${this._tracking.measurement}" ORDER BY time DESC LIMIT ${limit}`;
     try {
       const r = await callWithResponse(this._hass, this._tracking.query_service, { q });
       this._rows = parseInfluxRows(r && r.content != null ? r.content : r);
@@ -1299,6 +1449,8 @@ class BracketHistoryCard extends HTMLElement {
     const wins = {};
     for (const r of rows) wins[r.winner] = (wins[r.winner] || 0) + 1;
     const board = Object.entries(wins).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    // A one-off game doesn't hold a title, so it never fronts the banner.
+    const current = rows.find((r) => r.temp !== true) || latest;
 
     const filter = games.length > 1 ? `
       <select id="filter">
@@ -1317,9 +1469,9 @@ class BracketHistoryCard extends HTMLElement {
       }
       return r.runner_up ? `<span class="muted"> beat ${esc(r.runner_up)}</span>` : '';
     };
-    const champ = latest ? `
-      <div class="champ">🏆 Current champion:&nbsp;<strong>${esc(latest.winner)}</strong>
-        <span class="tnote">${esc(latest.game || 'Untitled')}${latest.mode ? ` · ${esc(modeLabelFromTag(latest.mode))}` : ''} · ${esc(fmtDate(latest.time))}</span>
+    const champ = current ? `
+      <div class="champ">🏆 Current champion:&nbsp;<strong>${esc(current.winner)}</strong>
+        <span class="tnote">${esc(current.game || 'Untitled')}${current.mode ? ` · ${esc(modeLabelFromTag(current.mode))}` : ''} · ${esc(fmtDate(current.last_played || current.time))}</span>
       </div>` : `<div class="pad muted">No results for this game yet.</div>`;
 
     return `
@@ -1336,7 +1488,7 @@ class BracketHistoryCard extends HTMLElement {
           <div class="sub">Results</div>
           <table>
             ${rows.map((r) => `<tr><td class="muted nowrap">${esc(fmtDate(r.time))}</td>
-              <td>${esc(r.game || 'Untitled')}${r.mode ? `<div class="muted tiny">${esc(modeLabelFromTag(r.mode))}</div>` : ''}</td>
+              <td>${esc(r.game || 'Untitled')}${r.mode ? `<div class="muted tiny">${esc(modeLabelFromTag(r.mode))}${r.temp === true ? ' <span class="tag">one-off</span>' : ''}</div>` : ''}</td>
               <td><strong>${esc(r.winner)}</strong>${detail(r)}
                   ${r.players ? `<div class="muted tiny">Players: ${esc(r.players)}</div>` : ''}
                   ${r.standings ? `<div class="muted tiny">${esc(r.standings)}</div>` : ''}</td></tr>`).join('')}
@@ -1350,6 +1502,8 @@ const HISTORY_STYLE = `
   .top { padding-bottom: 0; }
   .top:empty { display:none; }
   select { width:auto; padding: 6px 10px; }
+  .tag { display:inline-block; padding: 0 6px; border-radius: 999px; font-size:.7rem;
+         background: var(--secondary-background-color); color: var(--secondary-text-color); }
 `;
 
 if (!customElements.get('bracket-card')) {

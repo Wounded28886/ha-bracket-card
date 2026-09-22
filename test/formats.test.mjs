@@ -1,6 +1,6 @@
 import {
   roundRobinSchedule, roundRobin, swiss, kingOfTheHill, freeForAll,
-  encodeFfaRound, standingsSummary, kothChallengerCode, kothSnapshot,
+  encodeFfaRound, standingsSummary, kothChallengerCode, kothSnapshot, kothRebase,
 } from '../src/formats.js';
 
 let pass = 0, fail = 0;
@@ -119,8 +119,23 @@ section('swiss');
 // ---- king of the hill ----
 section('king of the hill');
 {
+  // Nobody is king until a game is won.
   const k0 = kingOfTheHill(names(4));
-  assert(k0.current.king === 0 && k0.current.challenger === 1 && k0.games.length === 0, 'starts P1 v P2');
+  assert(k0.king === null && k0.current.crowning === true, 'no king before the first game');
+  assert(k0.current.holder === 0 && k0.current.challenger === 1 && k0.games.length === 0, 'first game is P1 v P2');
+  assert(k0.queue.join() === '1,2,3', `holder is not in the waiting queue (${k0.queue})`);
+  assert(!k0.champion && !kingOfTheHill(names(4), '', true).champion, 'no champion without a king');
+  {
+    const crowned = kingOfTheHill(names(4), 'B2');   // P2 beats P1 for the hill
+    assert(crowned.king === 1 && crowned.games[0].crowning === true, 'first win crowns the winner');
+    const st = Object.fromEntries(crowned.standings.map((x) => [x.name, x]));
+    assert(st.P2.kingWins === 0 && st.P2.wins === 1 && st.P2.reigns === 1, 'the crowning win is not a win on the hill');
+    assert(st.P1.losses === 1 && crowned.queue.join() === '2,3,0', `loser goes to the back (${crowned.queue})`);
+    const held = kingOfTheHill(names(4), 'B2C1');
+    assert(held.kingWins === 1 && held.king === 1, 'the next win is a win on the hill');
+    // A player can also defend the hill they just took on the crowning game.
+    assert(kingOfTheHill(names(4), 'B1').king === 0, 'first-game holder can win the hill too');
+  }
   // King holds twice, then loses, then new king holds once.
   const k = kingOfTheHill(names(4), '1121');
   assert(k.games.length === 4, '4 games');
@@ -146,25 +161,42 @@ section('king of the hill');
   assert(snap.k === 3 && snap.g === 4 && snap.n === 1 && snap.s[0][0] === 2, `snapshot (${JSON.stringify(snap)})`);
   const resumed = kingOfTheHill(names(4), '', false, snap);
   assert(resumed.king === 3 && resumed.current.challenger === kf.queue[0], 'resumed: same king and next challenger');
+  assert(resumed.current.crowning === false, 'resumed: no crowning game, the king is already there');
   assert(resumed.games.length === 0 && resumed.totalGames === 4 && resumed.sessions === 2, 'resumed: fresh log, running totals kept');
   assert(resumed.standings.find((x) => x.name === 'P1').kingWins === 2, 'resumed: wins on top carried over');
   const resumed2 = kingOfTheHill(names(4), 'B1', true, snap);
   assert(resumed2.games[0].n === 5 && resumed2.kingWins === 2 && resumed2.champion.name === 'P4', 'resumed: game numbering and king wins continue');
   assert(kothSnapshot(resumed2).g === 5 && kothSnapshot(resumed2).n === 2, 'snapshot of a resumed session accumulates');
-  // A snapshot for a different player count is ignored.
-  assert(kingOfTheHill(names(3), '', false, snap).king === 0, 'mismatched snapshot ignored');
+  // A snapshot for a different player count is ignored (falls back to no king).
+  assert(kingOfTheHill(names(3), '', false, snap).king === null, 'mismatched snapshot ignored');
+
+  // --- re-rostering a lineage ---
+  const old = names(4);                       // P1..P4, king = P4 (idx 3)
+  const rebased = kothRebase(snap, old, ['P4', 'P2', 'P5']);   // P1/P3 leave, P5 joins
+  assert(rebased && rebased.k === 0, 'rebase: king found at its new index');
+  assert(rebased.s[0][0] === snap.s[3][0] && rebased.s[1][1] === snap.s[1][1], 'rebase: returning players keep their totals');
+  assert(rebased.s[2].join() === '0,0,0,0,0', 'rebase: newcomer starts at zero');
+  assert(rebased.q.includes(1) && rebased.q.includes(2) && !rebased.q.includes(0), `rebase: queue is everyone but the king (${rebased.q})`);
+  assert(rebased.q.indexOf(1) < rebased.q.indexOf(2), 'rebase: newcomers go to the back of the queue');
+  assert(rebased.g === snap.g && rebased.n === snap.n, 'rebase: running totals carried');
+  assert(kothRebase(snap, old, ['P1', 'P2']) === null, 'rebase refuses when the king is not playing');
+  const rr = kingOfTheHill(['P4', 'P2', 'P5'], '', false, rebased);
+  assert(rr.king === 0 && rr.totalGames === snap.g && rr.sessions === snap.n + 1, 'rebased lineage resumes');
   assert(!kingOfTheHill(names(4), '', true).champion, 'finishing with no games gives no champion');
 
-  // Chosen challengers: letter + outcome per game. Same story as '1121' but
-  // spelled out, then a hand-picked challenger who wasn't next in line.
+  // Chosen challengers: letter + outcome per game. Same pairings as the
+  // legacy '1121' session, but now the first game crowns rather than assuming.
   const spelled = kingOfTheHill(names(4), 'B1C1D2B1', true);
-  assert(JSON.stringify(spelled.games) === JSON.stringify(k.games), 'explicit challengers reproduce the legacy queue order');
-  const chosen = kingOfTheHill(names(4), 'D1');            // P4 jumps the queue to challenge first
-  assert(chosen.games[0].challenger === 3 && chosen.queue[0] === 1, `chosen challenger plays, queue order kept for the rest (${chosen.queue})`);
-  assert(chosen.current.challenger === 1, 'default next challenger is still the longest wait');
+  assert(spelled.games.map((g) => `${g.king}${g.challenger}${g.winner[0]}`).join() === k.games.map((g) => `${g.king}${g.challenger}${g.winner[0]}`).join(),
+    'explicit challengers reproduce the legacy pairings');
+  assert(spelled.standings.find((x) => x.name === 'P1').kingWins === 1 && k.standings.find((x) => x.name === 'P1').kingWins === 2,
+    'but the crowning game no longer counts as a win on the hill');
+  const chosen = kingOfTheHill(names(4), 'D1');            // P4 jumps the queue to play the first game
+  assert(chosen.games[0].challenger === 3 && chosen.king === 0, 'chosen challenger plays the crowning game');
+  assert(chosen.current.challenger === 1, `default next challenger is the longest wait (${chosen.queue})`);
   assert(kothChallengerCode(0) === 'A' && kothChallengerCode(26) === 'a', 'challenger codes');
   // Invalid: challenging yourself, unknown player, dangling letter -> stops parsing there.
-  assert(kingOfTheHill(names(4), 'A1').games.length === 0, 'king cannot challenge himself');
+  assert(kingOfTheHill(names(4), 'A1').games.length === 0, 'holder cannot challenge himself');
   assert(kingOfTheHill(names(4), 'B1Z1').games.length === 1, 'unknown challenger ignored');
   assert(kingOfTheHill(names(4), 'B1C').games.length === 1, 'dangling code ignored');
 }

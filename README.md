@@ -102,12 +102,29 @@ title: Friday Game Night
 | **Single elimination** | Lose once and you're out. Fastest. | Final winner |
 | **Round robin** | Everyone plays everyone once; rounds are laid out as columns next to a live standings table. Odd counts sit one player out per round. | Most wins, then head-to-head. A dead tie gets a single-elimination **decider** among the tied players. |
 | **Swiss system** | A fixed number of rounds (default log₂ of the players, or set it on the setup screen). Each round pairs players on the same record, avoiding rematches; the next round only appears once the current one is done. Odd counts give the lowest-ranked player a bye (counts as a win). | Most wins, then head-to-head, then strength of opposition (SOS). Dead ties get a decider. |
-| **King of the hill** | Winner stays on. Player 1 starts as 👑 king; the challenger defaults to whoever has waited longest, but tap any waiting name to send them up instead. The loser goes to the back of the queue. Tap the winner of each game; **Undo** takes one back, **Finish session** records it. **Ongoing:** with tracking on, a king-of-the-hill game is a lineage — the setup screen offers to **Continue** the last session for each game (same king, queue and totals, game numbering carries on) or start fresh, in which case the old lineage stays in the history. **Wins on top** — games won while holding the hill — are tracked per player. | Whoever holds the hill |
+| **King of the hill** | **Nobody starts as king:** the first two players play for the hill and the winner is crowned (that win doesn't count as a win *on* the hill). After that the winner stays on; the challenger defaults to whoever has waited longest, but tap any waiting name to send them up instead, and the loser goes to the back of the queue. **Undo** takes a game back, **Finish session** records it. **Wins on top** — games won while holding the hill — are tracked per player. See [Ongoing king of the hill](#ongoing-king-of-the-hill). | Whoever holds the hill |
 | **Free-for-all** | Everyone plays at once — a Mario Kart race, a hand of UNO. Each round, tap the players in finishing order and **Save round**; points default to *n* … 1 for 1st … last (`ffa_points` to override, e.g. `[10, 7, 5, 3, 2, 1]`); anyone not placed scores 0. **Finish** ends it. | Most points, then most 1sts. If the top is tied, Finish waits for one more round. |
 
 Every format records the same things when tracking is on: the game, format,
 winner, runner-up, **every player who took part**, and a standings summary
 (W–L, points, or wins on top).
+
+### Ongoing king of the hill
+
+With tracking on, each game name keeps **one ongoing king-of-the-hill title** —
+the Table tennis hill, the UNO hill — and the setup screen tells you who holds
+it. What happens when you press **Start** depends on who's in the player list:
+
+| Who's playing | What happens |
+| --- | --- |
+| No title recorded for this game yet | This becomes the game's ongoing title. |
+| The reigning champion **is** in the list | You're asked whether to carry that game on. **Continue it** → confirm the roster (drop anyone who isn't here, add newcomers; returning players keep their record, the champion stays) and play on with the same king, queue and running totals. **No — one-off game** → see below. |
+| The champion **isn't** playing | It's a **one-off** automatically: a normal game that crowns its own king for the evening, recorded to the history tagged `one-off`, leaving the real title untouched. |
+
+A continued title updates its single history entry rather than adding a row per
+evening, so the Hall of Fame always shows the current king and how long they've
+held it. Pressing **New game** over a live title offers **Record & clear** so the
+session is saved before it's cleared.
 
 ---
 
@@ -226,12 +243,13 @@ Measurement `result` (configurable) with:
 | field | `player_count` | `4` |
 | field | `standings` | `Dad=3-1, Mum=2-2, …` (round robin / Swiss W–L), `Dad=21, Mum=17` (free-for-all points), `Dad=5, Mum=2` (king of the hill wins on top). Absent for brackets. |
 | field | `top_wins` | King of the hill only: the king's wins while holding the hill |
-| field | `games`, `sessions`, `last_played` | King of the hill only: running totals for the lineage and when it was last played |
-| field | `state` | King of the hill only: the snapshot the card uses to continue the lineage (players, king, queue, totals) |
+| field | `games`, `sessions`, `last_played` | King of the hill only: running totals for the title and when it was last played |
+| field | `state` | King of the hill only: the snapshot the card uses to continue the title (players, king, queue, totals) |
+| field | `temp` | `true` on a one-off king-of-the-hill game — it never becomes the game's ongoing title |
 
 The point's timestamp is when the tournament was started. That means correcting
 a mis-tap after the champion was decided re-records over the same point rather
-than adding a duplicate — and a continued king-of-the-hill lineage keeps
+than adding a duplicate — and a continued king-of-the-hill title keeps
 updating its one point (`last_played` says when), so the history shows the
 current king rather than a row per evening. Because it's plain InfluxDB data, Grafana can chart it
 too: query `SELECT "winner", "runner_up", "game", "mode" FROM "result"` as a

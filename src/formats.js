@@ -180,17 +180,22 @@ export function swiss(players, w = '', opts = {}) {
 
 /* ======================= king of the hill ======================= */
 /*
- * Winner stays on. Player 1 starts as king; whoever is picked (or, by
- * default, whoever has waited longest) challenges; the loser goes to the
- * back of the queue. `w` is two chars per game: the challenger as a letter
- * (A-Z then a-z, see kothChallengerCode) and '1' the king held / '2' the
- * challenger took over. A `w` of bare 1/2 digits is the older form where
- * the queue always chose the challenger. Open-ended — `finished` ends it.
+ * Winner stays on. Nobody starts as king: the first two players play for the
+ * hill and the winner is crowned. After that the king stays on and whoever
+ * is picked (or, by default, whoever has waited longest) challenges; the
+ * loser goes to the back of the queue.
+ *
+ * `w` is two chars per game: the challenger as a letter (A-Z then a-z, see
+ * kothChallengerCode) and '1' the player on the hill held / '2' the
+ * challenger won. A `w` of bare 1/2 digits is the older form, where player 1
+ * started as king and the queue always chose the challenger; those sessions
+ * keep their original meaning. Open-ended — `finished` ends it.
  *
  * A lineage can span sessions: `base` is a snapshot of where the previous
  * session left off (king, queue order, per-player totals, games played),
- * produced by kothSnapshot(). The champion is whoever holds the hill;
- * standings rank by wins while king, then the holder, then total wins.
+ * produced by kothSnapshot() and re-rostered by kothRebase(). The champion
+ * is whoever holds the hill; standings rank by wins while king, then the
+ * holder, then total wins.
  */
 const KOTH_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 export const KOTH_MAX_PLAYERS = KOTH_LETTERS.length;
@@ -216,8 +221,10 @@ export function kingOfTheHill(players, w = '', finished = false, base = null) {
   const n = players.length;
   const stats = players.map((name, idx) => ({ idx, name, kingWins: 0, wins: 0, losses: 0, reigns: 0, played: 0 }));
   let queue = players.map((_, i) => i);
-  let king;
+  let king = null;                 // nobody holds the hill until a game is won
   let priorGames = 0, sessions = 1;
+  const codes = typeof w === 'string' ? w : '';
+  const legacy = codes.length > 0 && !/[A-Za-z]/.test(codes);
   if (validBase(base, n)) {
     king = base.k;
     queue = base.q.filter((i) => Number.isInteger(i) && i >= 0 && i < n && i !== king);
@@ -228,13 +235,12 @@ export function kingOfTheHill(players, w = '', finished = false, base = null) {
     });
     priorGames = Number.isInteger(base.g) ? base.g : 0;
     sessions = (Number.isInteger(base.n) ? base.n : 1) + 1;
-  } else {
+  } else if (legacy) {
+    // Sessions stored before the crowning game existed: player 1 was king.
     king = queue.shift();
     stats[king].reigns++;
   }
   const games = [];
-  const codes = typeof w === 'string' ? w : '';
-  const legacy = codes.length > 0 && !/[A-Za-z]/.test(codes);
   for (let g = 0; g < codes.length;) {
     let challenger;
     let c;
@@ -247,35 +253,67 @@ export function kingOfTheHill(players, w = '', finished = false, base = null) {
       c = codes[g + 1];
       g += 2;
     }
+    // With no king yet, the first player in the queue defends the hill.
+    const holder = king != null ? king : queue[0];
+    if (holder == null) break;
     if ((c !== '1' && c !== '2') || challenger == null || challenger < 0 || challenger >= n
-        || challenger === king) break;
+        || challenger === holder || !queue.includes(challenger)) break;
+    if (king == null) queue.shift();
     queue.splice(queue.indexOf(challenger), 1);
-    const game = { n: priorGames + games.length + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
-    games.push(game);
-    stats[king].played++; stats[challenger].played++;
-    if (c === '1') {
-      stats[king].kingWins++; stats[king].wins++; stats[challenger].losses++;
-      queue.push(challenger);
-    } else {
-      stats[challenger].wins++; stats[challenger].reigns++; stats[king].losses++;
-      queue.push(king);
-      king = challenger;
-    }
+    const winner = c === '1' ? holder : challenger;
+    const loser = c === '1' ? challenger : holder;
+    games.push({
+      n: priorGames + games.length + 1, king: holder, challenger,
+      winner: c === '1' ? 'king' : 'challenger', crowning: king == null,
+    });
+    stats[holder].played++; stats[challenger].played++;
+    stats[winner].wins++; stats[loser].losses++;
+    // A win that takes the hill is not a win *on* the hill.
+    if (king != null && winner === king) stats[king].kingWins++;
+    else stats[winner].reigns++;
+    king = winner;
+    queue.push(loser);
   }
   const standings = [...stats].sort((a, b) => b.kingWins - a.kingWins
     || (b.idx === king) - (a.idx === king) || b.wins - a.wins || cmpName(a, b));
   // Default challenger = longest wait; `queue` (in wait order) is the menu.
-  const current = finished ? null : { king, challenger: queue[0] };
+  const holder = king != null ? king : queue[0];
+  const waiting = king != null ? queue : queue.slice(1);
+  const current = finished ? null : { king, holder, challenger: waiting[0], crowning: king == null };
   const totalGames = priorGames + games.length;
   // The hill's holder is the champion; runner-up is the best of the rest.
   const rest = standings.filter((x) => x.idx !== king);
-  const champion = finished && totalGames > 0
+  const champion = finished && king != null && totalGames > 0
     ? { name: players[king], runnerUp: rest.length ? rest[0].name : null } : null;
   return {
-    kind: 'koth', players, games, king, queue: [...queue], current, standings,
+    kind: 'koth', players, games, king, queue: [...waiting], current, standings,
     finished, complete: finished, tie: null, champion, n, totalGames, sessions,
-    kingWins: stats[king].kingWins,
+    kingWins: king != null ? stats[king].kingWins : 0,
   };
+}
+
+/*
+ * Re-roster a lineage snapshot: keep every returning player's totals (matched
+ * by name), drop those who left, append newcomers to the back of the queue.
+ * Returns null if the king isn't in the new roster — a lineage only continues
+ * while its champion is playing.
+ */
+export function kothRebase(base, oldPlayers, newPlayers) {
+  if (!base || !Array.isArray(oldPlayers) || !Array.isArray(newPlayers)) return null;
+  const k = newPlayers.indexOf(oldPlayers[base.k]);
+  if (k < 0) return null;
+  const s = newPlayers.map((name) => {
+    const old = oldPlayers.indexOf(name);
+    const row = old >= 0 && base.s ? base.s[old] : null;
+    return row ? [...row] : [0, 0, 0, 0, 0];
+  });
+  const q = [];
+  for (const i of base.q || []) {
+    const idx = newPlayers.indexOf(oldPlayers[i]);
+    if (idx >= 0 && idx !== k && !q.includes(idx)) q.push(idx);
+  }
+  newPlayers.forEach((_, i) => { if (i !== k && !q.includes(i)) q.push(i); });
+  return { k, q, s, g: base.g || 0, n: base.n || 0 };
 }
 
 /* ======================= free-for-all ======================= */

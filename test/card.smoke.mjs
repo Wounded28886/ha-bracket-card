@@ -212,6 +212,12 @@ async function playOut(card, hassFor) {
       [now - 86400, 'Bob', 'Eve', 'Alice, Bob, Eve', 3, 'Mario Kart'],
       [now - 2 * 86400, 'Eve', 'Alice', 'Alice, Bob, Eve', 3, 'Mario Kart'],
     ] }] }] };
+  const influxTemp = { results: [{ series: [{ name: 'result',
+    columns: ['time', 'winner', 'runner_up', 'players', 'player_count', 'game', 'mode', 'temp'],
+    values: [
+      [now, 'Guest', 'Bob', 'Guest, Bob', 2, 'Table tennis', 'king_of_the_hill', true],
+      [now - 86400, 'Dad', 'Mum', 'Dad, Mum', 2, 'Table tennis', 'king_of_the_hill', null],
+    ] }] }] };
   const queries = [];
   const h = document.createElement('bracket-history-card');
   h.setConfig({ title: 'Hall of Fame' });
@@ -231,6 +237,14 @@ async function playOut(card, hassFor) {
   ok(/Current champion:[ \u00a0]Bob/.test(h.shadowRoot.textContent), 'filtering by game changes champion');
   ok(h.shadowRoot.querySelectorAll('table')[1].querySelectorAll('tr').length === 2, 'filter narrows results');
 
+  // A one-off never fronts the banner, and is tagged in the list.
+  const hT = document.createElement('bracket-history-card');
+  hT.setConfig({});
+  hT.hass = { states: {}, callWS: async () => ({ response: { status: 200, content: influxTemp } }) };
+  await tick(); await tick();
+  ok(/Current champion:[ \u00a0]Dad/.test(hT.shadowRoot.textContent), 'history: one-off games do not take the title');
+  ok(/one-off/.test(hT.shadowRoot.textContent), 'history: one-off row tagged');
+
   const hErr = document.createElement('bracket-history-card');
   hErr.setConfig({});
   hErr.hass = { states: {}, callWS: async () => { throw new Error('Service rest_command.game_night_query not found'); } };
@@ -241,24 +255,29 @@ async function playOut(card, hassFor) {
 // ---- formats: single elimination, round robin, swiss, king of the hill, free-for-all ----
 let kothSnapshotForResume = null;
 {
-  const mk = (mode, players, extra = {}) => {
+  const noLineage = { response: { status: 200, content: { results: [{ series: [] }] } } };
+  const mk = async (mode, players, extra = {}) => {
     saved = '';
     const ws = [];
-    const hassF = (value) => ({ ...makeHass(value), callWS: async (m) => { ws.push(m); return { response: { status: 204, content: '' } }; } });
+    const hassF = (value) => ({ ...makeHass(value), callWS: async (m) => {
+      ws.push(m);
+      return m.service === 'game_night_query' ? noLineage : { response: { status: 204, content: '' } };
+    } });
     const c = document.createElement('bracket-card');
     c.setConfig({ entity: ENTITY, tracking: true, ...extra });
     c.hass = hassF('');
     ok(!!c.shadowRoot.querySelector('#mode'), `${mode}: format select on setup`);
     c._mode = mode; c._game = 'G'; c._draft = players.join('\n');
     c.shadowRoot.querySelector('#create').click();
+    await tick(); await tick();
     c.hass = hassF(saved);
-    return { c, ws, hassF };
+    return { c, ws, hassF, writes: () => ws.filter((m) => m.service === 'game_night_write') };
   };
   const names = (card) => [...card.shadowRoot.querySelectorAll('.p.real .nm')].map((n) => n.textContent.trim());
 
   // single elimination: no losers bracket, no grand final, champion after n-1 matches
   {
-    const { c, ws, hassF } = mk('s', ['A', 'B', 'C', 'D', 'E']);
+    const { c, ws, hassF } = await mk('s', ['A', 'B', 'C', 'D', 'E']);
     ok(JSON.parse(saved).m === 's', 'single: mode stored');
     ok(!c.shadowRoot.querySelector('.section.lb') && !c.shadowRoot.querySelector('.gf-col'), 'single: no losers bracket / grand final');
     ok(c.shadowRoot.querySelector('.title .pill.mode')?.textContent === 'Single elimination', 'single: header pill');
@@ -272,7 +291,7 @@ let kothSnapshotForResume = null;
 
   // round robin: 4 players -> 6 matches in 3 rounds; standings; champion; tie decider
   {
-    const { c, ws, hassF } = mk('r', ['A', 'B', 'C', 'D']);
+    const { c, ws, hassF } = await mk('r', ['A', 'B', 'C', 'D']);
     ok(c.shadowRoot.querySelectorAll('.col').length === 3 && c.shadowRoot.querySelectorAll('.match').length === 6, 'rr: 3 rounds, 6 matches');
     ok(/Standings/.test(c.shadowRoot.textContent), 'rr: standings table');
     // Pick p1 everywhere except make it a clean sweep by index order: click first name of each undecided match.
@@ -319,7 +338,7 @@ let kothSnapshotForResume = null;
     c0.hass = makeHass('');
     c0._mode = 'w'; c0._render();
     ok(!!c0.shadowRoot.querySelector('#rounds'), 'swiss: rounds input shown');
-    const { c, hassF } = mk('w', ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']);
+    const { c, hassF } = await mk('w', ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']);
     ok(JSON.parse(saved).m === 'w' && /Round 1 of 3/.test(c.shadowRoot.textContent), 'swiss: 8 players -> 3 rounds');
     ok(c.shadowRoot.querySelectorAll('.col').length === 1, 'swiss: only round 1 shown');
     for (const m of c.shadowRoot.querySelectorAll('.match')) { m.querySelector('.p[data-click="1"]').click(); await tick(); c.hass = hassF(saved); }
@@ -334,37 +353,47 @@ let kothSnapshotForResume = null;
        `swiss: re-pick in round 1 drops round-2 decisions (w=${JSON.parse(saved).w})`);
   }
 
-  // king of the hill: tap winner, undo, finish, top_wins recorded
+  // king of the hill: nobody starts as king, first win crowns
   {
-    const { c, ws, hassF } = mk('k', ['A', 'B', 'C']);
-    const cur = () => names(c);
-    ok(cur().length === 2 && /👑/.test(cur()[0]), `koth: current game shown (${cur()})`);
-    const king0 = cur()[0].replace('👑 ', '');
-    c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved); // king holds
-    c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved); // holds again
-    c.shadowRoot.querySelector('.p[data-side="p2"]').click(); await tick(); c.hass = hassF(saved); // dethroned
-    ok(/^[A-Za-z]1[A-Za-z]1[A-Za-z]2$/.test(JSON.parse(saved).w), `koth: games encoded as challenger+outcome (${JSON.parse(saved).w})`);
-    ok(cur()[0] !== `👑 ${king0}`, 'koth: new king after challenger win');
+    const { c, hassF, writes } = await mk('k', ['A', 'B', 'C']);
+    const nms = () => [...c.shadowRoot.querySelectorAll('.p.real .nm')].map((n) => n.textContent.trim());
+    ok(nms().length === 2 && !/👑/.test(c.shadowRoot.textContent), `koth: first game has no king (${nms()})`);
+    ok(/winner takes the hill/.test(c.shadowRoot.textContent), 'koth: first game labelled as the crowning game');
+    const [holder0, chall0] = nms();
+    c.shadowRoot.querySelector('.p[data-side="p2"]').click(); await tick(); c.hass = hassF(saved);  // challenger takes it
+    ok(nms()[0] === `👑 ${chall0}`, `koth: first win crowns the winner (${nms()})`);
+    const king0 = chall0;
+    const board = () => Object.fromEntries([...c.shadowRoot.querySelectorAll('table tr')].slice(1)
+      .map((tr) => [...tr.children].map((td) => td.textContent.trim()))
+      .map((cells) => [cells[1].replace('👑 ', ''), cells[2]]));
+    ok(board()[king0] === '0', `koth: the crowning win is not a win on the hill (${JSON.stringify(board())})`);
+    ok(/took the hill from/.test(c.shadowRoot.textContent), 'koth: game log records the crowning');
+    c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved);  // king holds
+    ok(board()[king0] === '1' && nms()[0] === `👑 ${king0}`, 'koth: holding the hill counts');
+    ok(/^[A-Za-z]2[A-Za-z]1$/.test(JSON.parse(saved).w), `koth: games encoded as challenger+outcome (${JSON.parse(saved).w})`);
+    ok(!JSON.parse(saved).t, 'koth: a game with no existing lineage is the lineage, not a one-off');
     c.shadowRoot.querySelector('#undo').click(); await tick(); c.hass = hassF(saved);
-    ok(JSON.parse(saved).w.length === 4 && cur()[0] === `👑 ${king0}`, 'koth: undo restores previous king');
-    // Hand-pick the challenger: the last player in the queue instead of the default.
+    ok(JSON.parse(saved).w.length === 2 && board()[king0] === '0', 'koth: undo takes back a whole game');
+    // Hand-pick who plays next.
     const chipsK = () => [...c.shadowRoot.querySelectorAll('[data-koth]')];
     ok(chipsK().length === 2 && chipsK()[0].classList.contains('placed'), 'koth: waiting players offered, default highlighted');
     const pickName = chipsK()[1].textContent.trim();
     chipsK()[1].click();
-    ok(cur()[1] === pickName && chipsK()[1].classList.contains('placed'), 'koth: tapping a name makes them the challenger');
+    ok(nms()[1] === pickName && chipsK()[1].classList.contains('placed'), 'koth: tapping a name makes them the challenger');
     c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved);
     const P0 = JSON.parse(saved).p;
     ok(JSON.parse(saved).w.slice(-2) === `${'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[P0.indexOf(pickName)]}1`, `koth: chosen challenger stored (${JSON.parse(saved).w})`);
-    ok(/held off/.test(c.shadowRoot.textContent) && c.shadowRoot.textContent.includes(`held off ${pickName}`), 'koth: game log names the chosen challenger');
+    ok(c.shadowRoot.textContent.includes(`held off ${pickName}`), 'koth: game log names the chosen challenger');
     ok(!c.shadowRoot.querySelector('.champ'), 'koth: no champion before finish');
     c.shadowRoot.querySelector('#finish').click(); await tick();
     c.shadowRoot.querySelector('#do-finish').click(); await tick(); c.hass = hassF(saved);
     ok(JSON.parse(saved).f === 1 && new RegExp(`Champion:\\s*${king0}`).test(c.shadowRoot.querySelector('.champ').textContent), 'koth: finish crowns the reigning king');
-    ok(ws.length === 1 && new RegExp(`,mode=king_of_the_hill winner="${king0}".*top_wins=3i.*state=.*sessions=1i,games=3i,last_played=\\d+i`).test(ws[0].service_data.line), `koth: recorded with top_wins + snapshot (${ws[0] && ws[0].service_data.line})`);
-    const stateField = /state="((?:\\.|[^"])*)"/.exec(ws[0].service_data.line)[1].replace(/\\(.)/g, '$1');
+    const line = writes()[0].service_data.line;
+    ok(writes().length === 1 && new RegExp(`,mode=king_of_the_hill winner="${king0}".*top_wins=1i.*state=.*sessions=1i,games=2i,last_played=\\d+i`).test(line), `koth: recorded with top_wins + snapshot (${line})`);
+    ok(!/temp=true/.test(line), 'koth: a lineage game is not flagged one-off');
+    const stateField = /state="((?:\\.|[^"])*)"/.exec(line)[1].replace(/\\(.)/g, '$1');
     const snap = JSON.parse(stateField);
-    ok(Array.isArray(snap.p) && snap.p.length === 3 && snap.b && snap.b.g === 3 && snap.p[snap.b.k] === king0, `koth: snapshot decodes (${stateField})`);
+    ok(Array.isArray(snap.p) && snap.p.length === 3 && snap.b && snap.b.g === 2 && snap.p[snap.b.k] === king0, `koth: snapshot decodes (${stateField})`);
     kothSnapshotForResume = { snap, king0, players: snap.p };
     ok(!c.shadowRoot.querySelector('.p[data-click="1"]'), 'koth: no more picks after finish');
     c.shadowRoot.querySelector('#undo').click(); await tick(); c.hass = hassF(saved); // reopen
@@ -373,7 +402,7 @@ let kothSnapshotForResume = null;
 
   // free-for-all: tap order, save round, points, tie blocks finish, custom points
   {
-    const { c, ws, hassF } = mk('f', ['A', 'B', 'C'], { ffa_points: [5, 3, 1] });
+    const { c, ws, hassF } = await mk('f', ['A', 'B', 'C'], { ffa_points: [5, 3, 1] });
     const chips = () => [...c.shadowRoot.querySelectorAll('[data-ffa]')];
     ok(chips().length === 3 && c.shadowRoot.querySelector('#ffa-save').disabled, 'ffa: chips shown, save disabled until 2 placed');
     chips()[1].click(); chips()[0].click(); chips()[2].click();
@@ -395,42 +424,109 @@ let kothSnapshotForResume = null;
     ok(ws.length === 1 && new RegExp(`,mode=free_for_all winner="${P[1]}".*standings="${P[1]}=5`).test(ws[0].service_data.line), `ffa: recorded with points standings (${ws[0] && ws[0].service_data.line})`);
   }
 
-  // king of the hill lineage: Continue from the setup screen, then Record & clear
+  // king of the hill lineage: the decision happens when Start is pressed
   {
     const { snap, king0, players } = kothSnapshotForResume;
-    saved = '';
-    const ws = [];
+    const other = players.filter((n) => n !== king0);
     const now = Math.floor(Date.now() / 1000);
-    const influx = { results: [{ series: [{ name: 'result',
-      columns: ['time', 'state', 'winner', 'top_wins', 'games', 'sessions', 'last_played', 'game'],
+    const lineageRows = (extra = []) => ({ results: [{ series: [{ name: 'result',
+      columns: ['time', 'state', 'winner', 'top_wins', 'games', 'sessions', 'last_played', 'temp', 'game'],
       values: [
-        [now - 5 * 86400, JSON.stringify({ p: players, b: snap.b }), king0, 3, 3, 1, now - 86400, 'Table tennis'],
-        [now - 9 * 86400, JSON.stringify({ p: players, b: snap.b }), 'Old', 1, 1, 1, now - 9 * 86400, 'Table tennis'], // older lineage, same game: ignored
-        [now - 2 * 86400, 'not json', 'X', 1, 1, 1, now, 'Broken'],
-      ] }] }] };
-    const hassR = (value) => ({ ...makeHass(value), callWS: async (m) => { ws.push(m); return m.service === 'game_night_query' ? { response: { status: 200, content: influx } } : { response: { status: 204, content: '' } }; } });
-    const c = document.createElement('bracket-card');
-    c.setConfig({ entity: ENTITY, tracking: true });
-    c.hass = hassR('');
-    c._mode = 'k'; c._render();
-    await tick(); await tick();
-    ok(ws.length === 1 && /WHERE "mode" = 'king_of_the_hill'/.test(ws[0].service_data.q), 'koth setup queries previous lineages');
-    const rows = [...c.shadowRoot.querySelectorAll('.rrow')];
-    ok(rows.length === 1 && /Table tennis/.test(rows[0].textContent) && new RegExp(`👑 ${king0} \\(3 on top\\), 3 games`).test(rows[0].textContent), `one Continue row per game, latest wins (${rows.map((r) => r.textContent.replace(/\s+/g, ' ').trim())})`);
-    rows[0].querySelector('[data-resume]').click();
-    c.hass = hassR(saved);
-    const st = JSON.parse(saved);
-    ok(st.m === 'k' && st.g === 'Table tennis' && st.c === now - 5 * 86400 && st.b && st.b.g === 3 && st.w === '', 'resume restores players, baseline and the lineage timestamp');
-    ok(/Game 4 · session 2/.test(c.shadowRoot.textContent) && new RegExp(`👑 ${king0}`).test(c.shadowRoot.textContent), 'resumed session continues numbering with the same king');
-    // Play one game, then New game -> Record & clear.
-    c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassR(saved);
-    c.shadowRoot.querySelector('#new').click();
-    ok(!!c.shadowRoot.querySelector('#do-record-reset'), 'New game on a live lineage offers Record & clear');
-    c.shadowRoot.querySelector('#do-record-reset').click();
-    await tick(); await tick(); await tick();
-    const write = ws.find((m) => m.service === 'game_night_write');
-    ok(!!write && new RegExp(`winner="${king0}".*top_wins=4i.*sessions=2i,games=4i`).test(write.service_data.line) && write.service_data.line.endsWith(` ${now - 5 * 86400}`), `Record & clear writes the updated lineage on the original timestamp (${write && write.service_data.line})`);
-    ok(saved === '' && !!c.shadowRoot.querySelector('#draft'), 'then clears back to setup');
+        [now - 5 * 86400, JSON.stringify({ p: players, b: snap.b }), king0, 1, 2, 1, now - 86400, null, 'Table tennis'],
+        [now - 9 * 86400, JSON.stringify({ p: players, b: snap.b }), 'Old', 1, 1, 1, now - 9 * 86400, null, 'Table tennis'],
+        [now - 86400, '', 'Someone', 2, 2, 1, now - 86400, true, 'Darts'],   // one-off: never a lineage
+        ...extra,
+      ] }] }] });
+    const start = async (game, draft, rows = lineageRows()) => {
+      saved = '';
+      const ws = [];
+      const hassL = (value) => ({ ...makeHass(value), callWS: async (m) => {
+        ws.push(m);
+        return m.service === 'game_night_query' ? { response: { status: 200, content: rows } } : { response: { status: 204, content: '' } };
+      } });
+      const c = document.createElement('bracket-card');
+      c.setConfig({ entity: ENTITY, tracking: true });
+      c.hass = hassL('');
+      c._mode = 'k'; c._game = game; c._draft = draft.join('\n');
+      c._render();
+      await tick(); await tick();
+      c.shadowRoot.querySelector('#create').click();
+      await tick(); await tick();
+      return { c, ws, hassL, writes: () => ws.filter((m) => m.service === 'game_night_write') };
+    };
+
+    // The setup screen says where the title stands.
+    {
+      const { c, ws } = await start('Table tennis', players);
+      ok(ws.some((m) => /WHERE "mode" = 'king_of_the_hill'/.test(m.service_data.q || '')), 'setup queries for an existing king');
+      ok(new RegExp(`👑 ${king0} holds the Table tennis hill`).test(c.shadowRoot.textContent)
+         || /Carry that game on/.test(c.shadowRoot.textContent), 'setup names the reigning king');
+    }
+
+    // Champion is playing -> asked whether to carry the game on.
+    {
+      const { c, hassL, writes } = await start('Table tennis', players);
+      ok(/Carry that game on\?/.test(c.shadowRoot.textContent) && !!c.shadowRoot.querySelector('#koth-continue'), 'champion playing: prompted to continue');
+      ok(saved === '', 'nothing started until the prompt is answered');
+      c.shadowRoot.querySelector('#koth-continue').click();
+      const chips = () => [...c.shadowRoot.querySelectorAll('[data-roster]')];
+      ok(chips().length === players.length && !!c.shadowRoot.querySelector('#roster-go'), 'roster step lists the players');
+      const kingChip = chips().find((x) => x.textContent.includes(king0));
+      kingChip.click();
+      ok(kingChip.classList.contains('placed'), 'the champion cannot be dropped');
+      // Drop one returning player, add a newcomer.
+      chips().find((x) => x.textContent.trim() === other[0]).click();
+      c.shadowRoot.querySelector('#roster-add').value = 'Newbie';
+      c.shadowRoot.querySelector('#roster-add-btn').click();
+      ok([...c.shadowRoot.querySelectorAll('[data-roster]')].some((x) => /Newbie/.test(x.textContent)), 'newcomer added to the roster');
+      c.shadowRoot.querySelector('#roster-go').click();
+      c.hass = hassL(saved);
+      const st = JSON.parse(saved);
+      ok(st.m === 'k' && st.g === 'Table tennis' && st.c === now - 5 * 86400 && !st.t, 'continuing keeps the lineage timestamp and is not a one-off');
+      ok(!st.p.includes(other[0]) && st.p.includes('Newbie') && st.p.includes(king0), `roster applied (${st.p})`);
+      ok(st.b && st.p[st.b.k] === king0 && st.b.g === 2, 'baseline re-mapped onto the new roster');
+      ok(/Game 3 · session 2/.test(c.shadowRoot.textContent) && new RegExp(`👑 ${king0}`).test(c.shadowRoot.textContent), 'resumes with the same king and numbering');
+      // Record & clear writes back over the lineage's point.
+      c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassL(saved);
+      c.shadowRoot.querySelector('#new').click();
+      c.shadowRoot.querySelector('#do-record-reset').click();
+      await tick(); await tick(); await tick();
+      const line = writes()[0].service_data.line;
+      ok(writes().length === 1 && line.endsWith(` ${now - 5 * 86400}`) && /games=3i,/.test(line) && /sessions=2i/.test(line),
+         `Record & clear updates the lineage's own point (${line})`);
+      ok(!/temp=true/.test(line) && /state=/.test(line), 'continued lineage keeps its snapshot');
+      ok(saved === '' && !!c.shadowRoot.querySelector('#draft'), 'Record & clear returns to setup');
+    }
+
+    // Champion is playing but declined -> one-off.
+    {
+      const { c, hassL, writes } = await start('Table tennis', players);
+      c.shadowRoot.querySelector('#koth-oneoff').click();
+      c.hass = hassL(saved);
+      ok(JSON.parse(saved).t === 1 && !JSON.parse(saved).b, 'declining gives a one-off with no baseline');
+      ok(!!c.shadowRoot.querySelector('.pill.temp'), 'one-off marked in the header');
+      ok(!/👑/.test(c.shadowRoot.textContent), 'one-off starts with no king of its own');
+      c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassL(saved);
+      c.shadowRoot.querySelector('#finish').click(); await tick();
+      c.shadowRoot.querySelector('#do-finish').click(); await tick(); c.hass = hassL(saved);
+      const line = writes()[0].service_data.line;
+      ok(/temp=true/.test(line) && !/state=/.test(line), `one-off recorded with the temp flag and no snapshot (${line})`);
+    }
+
+    // Champion is not playing -> straight into a one-off, no prompt.
+    {
+      const { c, hassL } = await start('Table tennis', other.concat('Newbie'));
+      c.hass = hassL(saved);
+      ok(!c.shadowRoot.querySelector('#koth-continue'), 'champion absent: no prompt');
+      ok(JSON.parse(saved).t === 1 && JSON.parse(saved).g === 'Table tennis', 'champion absent: one-off started');
+    }
+
+    // A game with no lineage of its own starts a new one.
+    {
+      const { c, hassL } = await start('Darts', players);   // only a one-off row exists for Darts
+      c.hass = hassL(saved);
+      ok(!c.shadowRoot.querySelector('#koth-continue') && !JSON.parse(saved).t, 'a one-off row does not count as a lineage');
+    }
   }
 
   // default_mode config + legacy state without a mode decodes as double elim

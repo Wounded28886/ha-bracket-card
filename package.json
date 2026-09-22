@@ -1,6 +1,6 @@
 {
   "name": "ha-bracket-card",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Reusable double-elimination tournament bracket card for Home Assistant.",
   "type": "module",
   "scripts": {
