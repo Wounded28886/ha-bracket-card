@@ -600,12 +600,19 @@ function swiss(players, w = '', opts = {}) {
 
 /* ======================= king of the hill ======================= */
 /*
- * Winner stays on. Player 1 starts as king against player 2; the loser goes
- * to the back of the queue. `w` is one char per game: '1' the king held,
- * '2' the challenger took over. Open-ended — `finished` ends the session.
+ * Winner stays on. Player 1 starts as king; whoever is picked (or, by
+ * default, whoever has waited longest) challenges; the loser goes to the
+ * back of the queue. `w` is two chars per game: the challenger as a letter
+ * (A-Z then a-z, see kothChallengerCode) and '1' the king held / '2' the
+ * challenger took over. A `w` of bare 1/2 digits is the older form where
+ * the queue always chose the challenger. Open-ended — `finished` ends it.
  * Ranked by wins while king (the stat that matters here), then whoever
  * currently holds the hill, then total wins.
  */
+const KOTH_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+export const KOTH_MAX_PLAYERS = KOTH_LETTERS.length;
+function kothChallengerCode(idx) { return KOTH_LETTERS[idx]; }
+
 function kingOfTheHill(players, w = '', finished = false) {
   const n = players.length;
   const stats = players.map((name, idx) => ({ idx, name, kingWins: 0, wins: 0, losses: 0, reigns: 0, played: 0 }));
@@ -614,11 +621,23 @@ function kingOfTheHill(players, w = '', finished = false) {
   stats[king].reigns++;
   const games = [];
   const codes = typeof w === 'string' ? w : '';
-  for (let g = 0; g < codes.length; g++) {
-    const c = codes[g];
-    if (c !== '1' && c !== '2') break;
-    const challenger = queue.shift();
-    const game = { n: g + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
+  const legacy = codes.length > 0 && !/[A-Za-z]/.test(codes);
+  for (let g = 0; g < codes.length;) {
+    let challenger;
+    let c;
+    if (legacy) {
+      challenger = queue[0];
+      c = codes[g];
+      g += 1;
+    } else {
+      challenger = KOTH_LETTERS.indexOf(codes[g]);
+      c = codes[g + 1];
+      g += 2;
+    }
+    if ((c !== '1' && c !== '2') || challenger == null || challenger < 0 || challenger >= n
+        || challenger === king) break;
+    queue.splice(queue.indexOf(challenger), 1);
+    const game = { n: games.length + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
     games.push(game);
     stats[king].played++; stats[challenger].played++;
     if (c === '1') {
@@ -632,6 +651,7 @@ function kingOfTheHill(players, w = '', finished = false) {
   }
   const standings = [...stats].sort((a, b) => b.kingWins - a.kingWins
     || (b.idx === king) - (a.idx === king) || b.wins - a.wins || cmpName(a, b));
+  // Default challenger = longest wait; `queue` (in wait order) is the menu.
   const current = finished ? null : { king, challenger: queue[0] };
   const champion = finished && games.length > 0
     ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null;
@@ -734,7 +754,7 @@ function standingsSummary(result) {
  * the current champion, past winners and a leaderboard.
  */
 
-const CARD_VERSION = '1.3.0';
+const CARD_VERSION = '1.3.1';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.
@@ -1022,6 +1042,7 @@ class BracketCard extends HTMLElement {
     this._mode = 'd';       // setup format select
     this._swissRounds = ''; // setup rounds input (Swiss), '' = automatic
     this._ffaOrder = [];    // free-for-all: finishing order being entered
+    this._kothChallenger = null; // king of the hill: hand-picked next challenger
     this._confirmReset = false;
     this._confirmFinish = false;
     this._track = { busy: false, error: null };
@@ -1093,6 +1114,7 @@ class BracketCard extends HTMLElement {
     if (names.length < 2) { this._flash('Enter at least two players (one per line).'); return; }
     if (names.length > 64) { this._flash('That is a lot of players — cap is 64.'); return; }
     if (this._mode === 'f' && names.length > 36) { this._flash('Free-for-all supports up to 36 players.'); return; }
+    if (this._mode === 'k' && names.length > KOTH_MAX_PLAYERS) { this._flash(`King of the hill supports up to ${KOTH_MAX_PLAYERS} players.`); return; }
     // Entry order is seeding order, and a typed list is rarely random — so
     // shuffle once here. The shuffled order is what gets stored, so the
     // draw is stable from then on.
@@ -1100,6 +1122,7 @@ class BracketCard extends HTMLElement {
     const swissRounds = this._mode === 'w' ? Math.max(0, parseInt(this._swissRounds, 10) || 0) : 0;
     this._track = { busy: false, error: null };
     this._ffaOrder = [];
+    this._kothChallenger = null;
     this._save({
       players: names, mode: this._mode, w: '', decisions: {},
       resetBracket: this._config.reset_bracket !== false,
@@ -1127,7 +1150,13 @@ class BracketCard extends HTMLElement {
       if (!pickInBracket(res.tie, opts, decisions, matchId.slice(4), side)) return;
       d.decider = decisionsToCodes(res.tie, opts, decisions);
     } else if (d.mode === 'k') {
-      d.w += side === 'p1' ? '1' : '2';
+      const res = compute(d, this._config);
+      if (!res.current) return;
+      const pick = this._kothChallenger;
+      const challenger = pick != null && res.queue.includes(pick) ? pick : res.current.challenger;
+      if (challenger == null) return;
+      d.w += kothChallengerCode(challenger) + (side === 'p1' ? '1' : '2');
+      this._kothChallenger = null;
     } else {
       // round robin / Swiss: one code per match, addressed by its index.
       const res = compute(d, this._config);
@@ -1156,7 +1185,7 @@ class BracketCard extends HTMLElement {
     const d = decodeState(this._lastRaw);
     if (!d) return;
     if (d.finished) d.finished = false;
-    else if (d.mode === 'k') d.w = d.w.slice(0, -1);
+    else if (d.mode === 'k') d.w = d.w.slice(0, /[A-Za-z]/.test(d.w) ? -2 : -1); // letter+outcome per game (legacy: 1 char)
     else if (d.mode === 'f') d.w = d.w.split('|').filter(Boolean).slice(0, -1).join('|');
     this._afterChange(d);
   }
@@ -1507,6 +1536,10 @@ class BracketCard extends HTMLElement {
     const P = res.players;
     const cur = res.current;
     const kingStats = res.standings.find((s) => s.idx === res.king) || {};
+    // The challenger defaults to whoever has waited longest, but any waiting
+    // player can be tapped to take the game instead.
+    const picked = this._kothChallenger;
+    const challenger = cur && picked != null && res.queue.includes(picked) ? picked : (cur ? cur.challenger : null);
     const game = cur ? `
       <div class="match big" data-id="koth">
         <div class="mtag">Game ${res.games.length + 1}</div>
@@ -1515,10 +1548,11 @@ class BracketCard extends HTMLElement {
         </div>
         <div class="vs"></div>
         <div class="p real" data-match="koth" data-side="p2" data-click="1">
-          <span class="nm">${esc(P[cur.challenger])}</span><span class="side">challenger</span>
+          <span class="nm">${esc(P[challenger])}</span><span class="side">challenger</span>
         </div>
       </div>
-      <p class="muted small">Tap the winner. Up next: ${res.queue.slice(1).map((i) => esc(P[i])).join(', ') || '—'}</p>` : '';
+      <p class="muted small">Tap the winner above, or pick who challenges next:</p>
+      <div class="chips">${res.queue.map((i) => `<button class="chip${i === challenger ? ' placed' : ''}" data-koth="${i}">${esc(P[i])}</button>`).join('')}</div>` : '';
 
     const rows = res.standings.map((s, i) => `
       <tr><td class="rank">${i + 1}</td><td>${s.idx === res.king && !res.finished ? '👑 ' : ''}${esc(s.name)}</td>
@@ -1613,6 +1647,9 @@ class BracketCard extends HTMLElement {
     on('#do-finish', () => this._finish());
     on('#ffa-save', () => this._saveFfaRound());
     on('#ffa-clear', () => { this._ffaOrder = []; this._render(); });
+    this.shadowRoot.querySelectorAll('[data-koth]').forEach((el) => {
+      el.onclick = () => { this._kothChallenger = Number(el.getAttribute('data-koth')); this._render(); };
+    });
     this.shadowRoot.querySelectorAll('[data-ffa]').forEach((el) => {
       el.onclick = () => {
         const i = Number(el.getAttribute('data-ffa'));

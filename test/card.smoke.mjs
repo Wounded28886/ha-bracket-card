@@ -342,15 +342,25 @@ async function playOut(card, hassFor) {
     c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved); // king holds
     c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved); // holds again
     c.shadowRoot.querySelector('.p[data-side="p2"]').click(); await tick(); c.hass = hassF(saved); // dethroned
-    ok(JSON.parse(saved).w === '112', 'koth: games encoded');
+    ok(/^[A-Za-z]1[A-Za-z]1[A-Za-z]2$/.test(JSON.parse(saved).w), `koth: games encoded as challenger+outcome (${JSON.parse(saved).w})`);
     ok(cur()[0] !== `👑 ${king0}`, 'koth: new king after challenger win');
     c.shadowRoot.querySelector('#undo').click(); await tick(); c.hass = hassF(saved);
-    ok(JSON.parse(saved).w === '11' && cur()[0] === `👑 ${king0}`, 'koth: undo restores previous king');
+    ok(JSON.parse(saved).w.length === 4 && cur()[0] === `👑 ${king0}`, 'koth: undo restores previous king');
+    // Hand-pick the challenger: the last player in the queue instead of the default.
+    const chipsK = () => [...c.shadowRoot.querySelectorAll('[data-koth]')];
+    ok(chipsK().length === 2 && chipsK()[0].classList.contains('placed'), 'koth: waiting players offered, default highlighted');
+    const pickName = chipsK()[1].textContent.trim();
+    chipsK()[1].click();
+    ok(cur()[1] === pickName && chipsK()[1].classList.contains('placed'), 'koth: tapping a name makes them the challenger');
+    c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassF(saved);
+    const P0 = JSON.parse(saved).p;
+    ok(JSON.parse(saved).w.slice(-2) === `${'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[P0.indexOf(pickName)]}1`, `koth: chosen challenger stored (${JSON.parse(saved).w})`);
+    ok(/held off/.test(c.shadowRoot.textContent) && c.shadowRoot.textContent.includes(`held off ${pickName}`), 'koth: game log names the chosen challenger');
     ok(!c.shadowRoot.querySelector('.champ'), 'koth: no champion before finish');
     c.shadowRoot.querySelector('#finish').click(); await tick();
     c.shadowRoot.querySelector('#do-finish').click(); await tick(); c.hass = hassF(saved);
     ok(JSON.parse(saved).f === 1 && /Champion:/.test(c.shadowRoot.querySelector('.champ').textContent), 'koth: finish crowns champion');
-    ok(ws.length === 1 && new RegExp(`,mode=king_of_the_hill winner="${king0}".*top_wins=2i`).test(ws[0].service_data.line), `koth: recorded with top_wins (${ws[0] && ws[0].service_data.line})`);
+    ok(ws.length === 1 && new RegExp(`,mode=king_of_the_hill winner="${king0}".*top_wins=3i`).test(ws[0].service_data.line), `koth: recorded with top_wins (${ws[0] && ws[0].service_data.line})`);
     ok(!c.shadowRoot.querySelector('.p[data-click="1"]'), 'koth: no more picks after finish');
     c.shadowRoot.querySelector('#undo').click(); await tick(); c.hass = hassF(saved); // reopen
     ok(JSON.parse(saved).f !== 1 && JSON.parse(saved).r !== 1 && !!c.shadowRoot.querySelector('.p[data-click="1"]'), 'koth: reopen clears finish + recorded');

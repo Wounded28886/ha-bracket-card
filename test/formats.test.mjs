@@ -1,6 +1,6 @@
 import {
   roundRobinSchedule, roundRobin, swiss, kingOfTheHill, freeForAll,
-  encodeFfaRound, standingsSummary,
+  encodeFfaRound, standingsSummary, kothChallengerCode,
 } from '../src/formats.js';
 
 let pass = 0, fail = 0;
@@ -140,6 +140,19 @@ section('king of the hill');
   assert(kt.standings[0].name === 'P3' && kt.standings[0].kingWins === 1, `tie broken in favour of current king (got ${kt.standings[0].name})`);
   assert(standingsSummary(kf) === 'P1=2, P4=1, P2=0, P3=0', `koth summary (${standingsSummary(kf)})`);
   assert(!kingOfTheHill(names(4), '', true).champion, 'finishing with no games gives no champion');
+
+  // Chosen challengers: letter + outcome per game. Same story as '1121' but
+  // spelled out, then a hand-picked challenger who wasn't next in line.
+  const spelled = kingOfTheHill(names(4), 'B1C1D2B1', true);
+  assert(JSON.stringify(spelled.games) === JSON.stringify(k.games), 'explicit challengers reproduce the legacy queue order');
+  const chosen = kingOfTheHill(names(4), 'D1');            // P4 jumps the queue to challenge first
+  assert(chosen.games[0].challenger === 3 && chosen.queue[0] === 1, `chosen challenger plays, queue order kept for the rest (${chosen.queue})`);
+  assert(chosen.current.challenger === 1, 'default next challenger is still the longest wait');
+  assert(kothChallengerCode(0) === 'A' && kothChallengerCode(26) === 'a', 'challenger codes');
+  // Invalid: challenging yourself, unknown player, dangling letter -> stops parsing there.
+  assert(kingOfTheHill(names(4), 'A1').games.length === 0, 'king cannot challenge himself');
+  assert(kingOfTheHill(names(4), 'B1Z1').games.length === 1, 'unknown challenger ignored');
+  assert(kingOfTheHill(names(4), 'B1C').games.length === 1, 'dangling code ignored');
 }
 
 // ---- free-for-all ----

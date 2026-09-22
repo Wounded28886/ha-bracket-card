@@ -180,12 +180,19 @@ export function swiss(players, w = '', opts = {}) {
 
 /* ======================= king of the hill ======================= */
 /*
- * Winner stays on. Player 1 starts as king against player 2; the loser goes
- * to the back of the queue. `w` is one char per game: '1' the king held,
- * '2' the challenger took over. Open-ended — `finished` ends the session.
+ * Winner stays on. Player 1 starts as king; whoever is picked (or, by
+ * default, whoever has waited longest) challenges; the loser goes to the
+ * back of the queue. `w` is two chars per game: the challenger as a letter
+ * (A-Z then a-z, see kothChallengerCode) and '1' the king held / '2' the
+ * challenger took over. A `w` of bare 1/2 digits is the older form where
+ * the queue always chose the challenger. Open-ended — `finished` ends it.
  * Ranked by wins while king (the stat that matters here), then whoever
  * currently holds the hill, then total wins.
  */
+const KOTH_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+export const KOTH_MAX_PLAYERS = KOTH_LETTERS.length;
+export function kothChallengerCode(idx) { return KOTH_LETTERS[idx]; }
+
 export function kingOfTheHill(players, w = '', finished = false) {
   const n = players.length;
   const stats = players.map((name, idx) => ({ idx, name, kingWins: 0, wins: 0, losses: 0, reigns: 0, played: 0 }));
@@ -194,11 +201,23 @@ export function kingOfTheHill(players, w = '', finished = false) {
   stats[king].reigns++;
   const games = [];
   const codes = typeof w === 'string' ? w : '';
-  for (let g = 0; g < codes.length; g++) {
-    const c = codes[g];
-    if (c !== '1' && c !== '2') break;
-    const challenger = queue.shift();
-    const game = { n: g + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
+  const legacy = codes.length > 0 && !/[A-Za-z]/.test(codes);
+  for (let g = 0; g < codes.length;) {
+    let challenger;
+    let c;
+    if (legacy) {
+      challenger = queue[0];
+      c = codes[g];
+      g += 1;
+    } else {
+      challenger = KOTH_LETTERS.indexOf(codes[g]);
+      c = codes[g + 1];
+      g += 2;
+    }
+    if ((c !== '1' && c !== '2') || challenger == null || challenger < 0 || challenger >= n
+        || challenger === king) break;
+    queue.splice(queue.indexOf(challenger), 1);
+    const game = { n: games.length + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
     games.push(game);
     stats[king].played++; stats[challenger].played++;
     if (c === '1') {
@@ -212,6 +231,7 @@ export function kingOfTheHill(players, w = '', finished = false) {
   }
   const standings = [...stats].sort((a, b) => b.kingWins - a.kingWins
     || (b.idx === king) - (a.idx === king) || b.wins - a.wins || cmpName(a, b));
+  // Default challenger = longest wait; `queue` (in wait order) is the menu.
   const current = finished ? null : { king, challenger: queue[0] };
   const champion = finished && games.length > 0
     ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null;
