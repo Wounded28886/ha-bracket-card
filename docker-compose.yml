@@ -1,5 +1,6 @@
 # Tournament board — a self-contained server. Nothing else is required: no
-# Home Assistant, no database, no broker, no internet once it's built.
+# Home Assistant, no database, no broker. Pulls a prebuilt image; after that
+# it needs no internet at all.
 #
 #   docker compose up -d        ->  http://<host>:8099
 #
@@ -7,10 +8,10 @@
 # recorded result. Back that file up and you have backed up the lot.
 services:
   bracket:
-    # Builds from the files next to this compose file. See server/README.md
-    # for the Synology Container Manager walkthrough.
-    build: .
-    image: bracket-board:latest
+    # Prebuilt, multi-arch (x86_64 and ARM). Swap `image:` for `build: .` to
+    # build from these files instead. See server/README.md for the Synology
+    # Container Manager walkthrough.
+    image: ghcr.io/wounded28886/bracket-board:latest
     container_name: bracket
     restart: unless-stopped
     ports:

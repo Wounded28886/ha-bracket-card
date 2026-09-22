@@ -21,40 +21,59 @@ container talks to nobody; every phone, tablet and TV just opens its URL.
 
 ## Synology (Container Manager)
 
-1. **Get the files onto the NAS.** Download the repository as a ZIP
-   ([Code → Download ZIP](https://github.com/Wounded28886/ha-bracket-card/archive/refs/heads/main.zip))
-   and extract it to a folder in your `docker` share, e.g.
-   `/volume1/docker/bracket`. (File Station can extract the ZIP for you.)
-2. **Container Manager → Project → Create.**
+Nothing is built on the NAS — it pulls a ready-made image.
+
+1. **Container Manager → Project → Create.**
    - **Project name:** `bracket`
-   - **Path:** the folder from step 1
-   - **Source:** *Use an existing docker-compose.yml* — it's already in there.
-3. Click through and let it build. The first build takes a couple of minutes
-   (it downloads the Node base image); after that it starts in seconds.
-4. Open **`http://<nas-ip>:8099`**.
+   - **Path:** a new folder, e.g. `/volume1/docker/bracket`
+   - **Source:** *Create docker-compose.yml* and paste:
 
-The project folder will grow a `data/` directory holding `store.json`. Add it
-to Hyper Backup and your game history is covered.
+   ```yaml
+   services:
+     bracket:
+       image: ghcr.io/wounded28886/bracket-board:latest
+       container_name: bracket
+       restart: unless-stopped
+       ports:
+         - "8099:8099"
+       volumes:
+         - ./data:/data
+       environment:
+         TITLE: "Game Night"
+   ```
 
-**Updating:** replace the folder's contents with a newer download, then in
-Container Manager open the project and choose **Build** (or *Action → Reset*).
-Your `data/` folder is untouched.
+2. Click through; it downloads the image (about 60 MB) and starts in seconds.
+3. Open **`http://<nas-ip>:8099`**.
+
+The project folder grows a `data/` directory holding `store.json` — the
+tournament in progress and every result. Add it to Hyper Backup and your game
+history is covered.
+
+**Updating:** Container Manager → the project → **Action → Reset** (or
+*Image → pull* then restart) picks up the newest image. Your `data/` folder is
+untouched. Pin a version instead of tracking `latest` by using, say,
+`ghcr.io/wounded28886/bracket-board:1.6`.
+
+The image is public, multi-arch (`linux/amd64` and `linux/arm64`) and built by
+GitHub Actions straight from this repository, so there's no account to set up
+and nothing to log in to.
 
 ## Anywhere else
 
 ```bash
-git clone https://github.com/Wounded28886/ha-bracket-card
-cd ha-bracket-card
-docker compose up -d          # -> http://localhost:8099
-```
-
-or without compose:
-
-```bash
-docker build -t bracket-board .
 docker run -d --name bracket -p 8099:8099 \
   -v /volume1/docker/bracket/data:/data \
-  -e TITLE="Game Night" --restart unless-stopped bracket-board
+  -e TITLE="Game Night" --restart unless-stopped \
+  ghcr.io/wounded28886/bracket-board:latest
+```
+
+### Building it yourself instead
+
+```bash
+git clone https://github.com/Wounded28886/ha-bracket-card
+cd ha-bracket-card
+docker build -t bracket-board .
+docker run -d --name bracket -p 8099:8099 -v "$PWD/data:/data" bracket-board
 ```
 
 or, if you'd rather not use Docker at all — it's plain Node with no

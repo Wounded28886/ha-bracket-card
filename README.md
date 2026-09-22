@@ -295,7 +295,8 @@ either. Every format, the result history and the ongoing king-of-the-hill
 titles work exactly the same.
 
 ```bash
-docker compose up -d      # -> http://<host>:8099
+docker run -d -p 8099:8099 -v ./data:/data \
+  ghcr.io/wounded28886/bracket-board:latest      # -> http://<host>:8099
 ```
 
 **[server/README.md](server/README.md) is the whole story for that deployment** —

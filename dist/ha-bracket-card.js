@@ -832,7 +832,7 @@ function standingsSummary(result) {
  * the current champion, past winners and a leaderboard.
  */
 
-const CARD_VERSION = '1.6.1';
+const CARD_VERSION = '1.6.2';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.
