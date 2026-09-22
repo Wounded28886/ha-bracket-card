@@ -218,7 +218,7 @@ async function playOut(card, hassFor) {
   h.hass = { states: {}, callWS: async (msg) => { queries.push(msg); return { response: { status: 200, content: influx } }; } };
   await tick(); await tick();
   ok(queries.length === 1 && queries[0].service === 'game_night_query'
-     && /^SELECT .*"standings", "top_wins", "game", "mode" FROM "result" ORDER BY time DESC LIMIT 100$/.test(queries[0].service_data.q), 'history queries InfluxQL via rest_command');
+     && /^SELECT .*"standings", "top_wins", .*"game", "mode" FROM "result" ORDER BY time DESC LIMIT 100$/.test(queries[0].service_data.q), 'history queries InfluxQL via rest_command');
   const txt = h.shadowRoot.textContent;
   ok(/Current champion:[ \u00a0]Eve/.test(txt) && /UNO/.test(txt), 'current champion from most recent row');
   const board = [...h.shadowRoot.querySelectorAll('table')[0].querySelectorAll('tr')]
@@ -239,6 +239,7 @@ async function playOut(card, hassFor) {
 }
 
 // ---- formats: single elimination, round robin, swiss, king of the hill, free-for-all ----
+let kothSnapshotForResume = null;
 {
   const mk = (mode, players, extra = {}) => {
     saved = '';
@@ -359,8 +360,12 @@ async function playOut(card, hassFor) {
     ok(!c.shadowRoot.querySelector('.champ'), 'koth: no champion before finish');
     c.shadowRoot.querySelector('#finish').click(); await tick();
     c.shadowRoot.querySelector('#do-finish').click(); await tick(); c.hass = hassF(saved);
-    ok(JSON.parse(saved).f === 1 && /Champion:/.test(c.shadowRoot.querySelector('.champ').textContent), 'koth: finish crowns champion');
-    ok(ws.length === 1 && new RegExp(`,mode=king_of_the_hill winner="${king0}".*top_wins=3i`).test(ws[0].service_data.line), `koth: recorded with top_wins (${ws[0] && ws[0].service_data.line})`);
+    ok(JSON.parse(saved).f === 1 && new RegExp(`Champion:\\s*${king0}`).test(c.shadowRoot.querySelector('.champ').textContent), 'koth: finish crowns the reigning king');
+    ok(ws.length === 1 && new RegExp(`,mode=king_of_the_hill winner="${king0}".*top_wins=3i.*state=.*sessions=1i,games=3i,last_played=\\d+i`).test(ws[0].service_data.line), `koth: recorded with top_wins + snapshot (${ws[0] && ws[0].service_data.line})`);
+    const stateField = /state="((?:\\.|[^"])*)"/.exec(ws[0].service_data.line)[1].replace(/\\(.)/g, '$1');
+    const snap = JSON.parse(stateField);
+    ok(Array.isArray(snap.p) && snap.p.length === 3 && snap.b && snap.b.g === 3 && snap.p[snap.b.k] === king0, `koth: snapshot decodes (${stateField})`);
+    kothSnapshotForResume = { snap, king0, players: snap.p };
     ok(!c.shadowRoot.querySelector('.p[data-click="1"]'), 'koth: no more picks after finish');
     c.shadowRoot.querySelector('#undo').click(); await tick(); c.hass = hassF(saved); // reopen
     ok(JSON.parse(saved).f !== 1 && JSON.parse(saved).r !== 1 && !!c.shadowRoot.querySelector('.p[data-click="1"]'), 'koth: reopen clears finish + recorded');
@@ -388,6 +393,44 @@ async function playOut(card, hassFor) {
     c.shadowRoot.querySelector('#do-finish').click(); await tick(); c.hass = hassF(saved);
     ok(/Champion:/.test(c.shadowRoot.querySelector('.champ')?.textContent || ''), 'ffa: champion on finish');
     ok(ws.length === 1 && new RegExp(`,mode=free_for_all winner="${P[1]}".*standings="${P[1]}=5`).test(ws[0].service_data.line), `ffa: recorded with points standings (${ws[0] && ws[0].service_data.line})`);
+  }
+
+  // king of the hill lineage: Continue from the setup screen, then Record & clear
+  {
+    const { snap, king0, players } = kothSnapshotForResume;
+    saved = '';
+    const ws = [];
+    const now = Math.floor(Date.now() / 1000);
+    const influx = { results: [{ series: [{ name: 'result',
+      columns: ['time', 'state', 'winner', 'top_wins', 'games', 'sessions', 'last_played', 'game'],
+      values: [
+        [now - 5 * 86400, JSON.stringify({ p: players, b: snap.b }), king0, 3, 3, 1, now - 86400, 'Table tennis'],
+        [now - 9 * 86400, JSON.stringify({ p: players, b: snap.b }), 'Old', 1, 1, 1, now - 9 * 86400, 'Table tennis'], // older lineage, same game: ignored
+        [now - 2 * 86400, 'not json', 'X', 1, 1, 1, now, 'Broken'],
+      ] }] }] };
+    const hassR = (value) => ({ ...makeHass(value), callWS: async (m) => { ws.push(m); return m.service === 'game_night_query' ? { response: { status: 200, content: influx } } : { response: { status: 204, content: '' } }; } });
+    const c = document.createElement('bracket-card');
+    c.setConfig({ entity: ENTITY, tracking: true });
+    c.hass = hassR('');
+    c._mode = 'k'; c._render();
+    await tick(); await tick();
+    ok(ws.length === 1 && /WHERE "mode" = 'king_of_the_hill'/.test(ws[0].service_data.q), 'koth setup queries previous lineages');
+    const rows = [...c.shadowRoot.querySelectorAll('.rrow')];
+    ok(rows.length === 1 && /Table tennis/.test(rows[0].textContent) && new RegExp(`👑 ${king0} \\(3 on top\\), 3 games`).test(rows[0].textContent), `one Continue row per game, latest wins (${rows.map((r) => r.textContent.replace(/\s+/g, ' ').trim())})`);
+    rows[0].querySelector('[data-resume]').click();
+    c.hass = hassR(saved);
+    const st = JSON.parse(saved);
+    ok(st.m === 'k' && st.g === 'Table tennis' && st.c === now - 5 * 86400 && st.b && st.b.g === 3 && st.w === '', 'resume restores players, baseline and the lineage timestamp');
+    ok(/Game 4 · session 2/.test(c.shadowRoot.textContent) && new RegExp(`👑 ${king0}`).test(c.shadowRoot.textContent), 'resumed session continues numbering with the same king');
+    // Play one game, then New game -> Record & clear.
+    c.shadowRoot.querySelector('.p[data-side="p1"]').click(); await tick(); c.hass = hassR(saved);
+    c.shadowRoot.querySelector('#new').click();
+    ok(!!c.shadowRoot.querySelector('#do-record-reset'), 'New game on a live lineage offers Record & clear');
+    c.shadowRoot.querySelector('#do-record-reset').click();
+    await tick(); await tick(); await tick();
+    const write = ws.find((m) => m.service === 'game_night_write');
+    ok(!!write && new RegExp(`winner="${king0}".*top_wins=4i.*sessions=2i,games=4i`).test(write.service_data.line) && write.service_data.line.endsWith(` ${now - 5 * 86400}`), `Record & clear writes the updated lineage on the original timestamp (${write && write.service_data.line})`);
+    ok(saved === '' && !!c.shadowRoot.querySelector('#draft'), 'then clears back to setup');
   }
 
   // default_mode config + legacy state without a mode decodes as double elim

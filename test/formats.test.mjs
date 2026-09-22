@@ -1,6 +1,6 @@
 import {
   roundRobinSchedule, roundRobin, swiss, kingOfTheHill, freeForAll,
-  encodeFfaRound, standingsSummary, kothChallengerCode,
+  encodeFfaRound, standingsSummary, kothChallengerCode, kothSnapshot,
 } from '../src/formats.js';
 
 let pass = 0, fail = 0;
@@ -133,12 +133,26 @@ section('king of the hill');
   assert(by.P4.kingWins === 1 && by.P4.reigns === 1 && by.P4.wins === 2, 'P4: 1 win on top, 2 wins total');
   assert(!k.champion, 'no champion until finished');
   const kf = kingOfTheHill(names(4), '1121', true);
-  assert(kf.champion && kf.champion.name === 'P1' && kf.champion.runnerUp === 'P4', 'champion = most wins as king');
+  assert(kf.champion && kf.champion.name === 'P4' && kf.champion.runnerUp === 'P1', `champion = whoever holds the hill (got ${kf.champion && kf.champion.name}/${kf.champion && kf.champion.runnerUp})`);
+  assert(kf.kingWins === 1 && kf.totalGames === 4 && kf.sessions === 1, 'king wins / totals reported');
   assert(kf.current === null, 'no current game once finished');
   // Tie on king wins -> current king ranks first.
   const kt = kingOfTheHill(names(3), '121', true);
   assert(kt.standings[0].name === 'P3' && kt.standings[0].kingWins === 1, `tie broken in favour of current king (got ${kt.standings[0].name})`);
   assert(standingsSummary(kf) === 'P1=2, P4=1, P2=0, P3=0', `koth summary (${standingsSummary(kf)})`);
+
+  // Carry a lineage across sessions via a snapshot.
+  const snap = kothSnapshot(kf);
+  assert(snap.k === 3 && snap.g === 4 && snap.n === 1 && snap.s[0][0] === 2, `snapshot (${JSON.stringify(snap)})`);
+  const resumed = kingOfTheHill(names(4), '', false, snap);
+  assert(resumed.king === 3 && resumed.current.challenger === kf.queue[0], 'resumed: same king and next challenger');
+  assert(resumed.games.length === 0 && resumed.totalGames === 4 && resumed.sessions === 2, 'resumed: fresh log, running totals kept');
+  assert(resumed.standings.find((x) => x.name === 'P1').kingWins === 2, 'resumed: wins on top carried over');
+  const resumed2 = kingOfTheHill(names(4), 'B1', true, snap);
+  assert(resumed2.games[0].n === 5 && resumed2.kingWins === 2 && resumed2.champion.name === 'P4', 'resumed: game numbering and king wins continue');
+  assert(kothSnapshot(resumed2).g === 5 && kothSnapshot(resumed2).n === 2, 'snapshot of a resumed session accumulates');
+  // A snapshot for a different player count is ignored.
+  assert(kingOfTheHill(names(3), '', false, snap).king === 0, 'mismatched snapshot ignored');
   assert(!kingOfTheHill(names(4), '', true).champion, 'finishing with no games gives no champion');
 
   // Chosen challengers: letter + outcome per game. Same story as '1121' but

@@ -102,7 +102,7 @@ title: Friday Game Night
 | **Single elimination** | Lose once and you're out. Fastest. | Final winner |
 | **Round robin** | Everyone plays everyone once; rounds are laid out as columns next to a live standings table. Odd counts sit one player out per round. | Most wins, then head-to-head. A dead tie gets a single-elimination **decider** among the tied players. |
 | **Swiss system** | A fixed number of rounds (default log₂ of the players, or set it on the setup screen). Each round pairs players on the same record, avoiding rematches; the next round only appears once the current one is done. Odd counts give the lowest-ranked player a bye (counts as a win). | Most wins, then head-to-head, then strength of opposition (SOS). Dead ties get a decider. |
-| **King of the hill** | Winner stays on. Player 1 starts as 👑 king; the challenger defaults to whoever has waited longest, but tap any waiting name to send them up instead. The loser goes to the back of the queue. Tap the winner of each game; **Undo** takes one back, **Finish session** ends it. The stat that matters is **wins on top** — games won while holding the hill — and that's what gets recorded. | Most wins on top (ties: whoever holds the hill) |
+| **King of the hill** | Winner stays on. Player 1 starts as 👑 king; the challenger defaults to whoever has waited longest, but tap any waiting name to send them up instead. The loser goes to the back of the queue. Tap the winner of each game; **Undo** takes one back, **Finish session** records it. **Ongoing:** with tracking on, a king-of-the-hill game is a lineage — the setup screen offers to **Continue** the last session for each game (same king, queue and totals, game numbering carries on) or start fresh, in which case the old lineage stays in the history. **Wins on top** — games won while holding the hill — are tracked per player. | Whoever holds the hill |
 | **Free-for-all** | Everyone plays at once — a Mario Kart race, a hand of UNO. Each round, tap the players in finishing order and **Save round**; points default to *n* … 1 for 1st … last (`ffa_points` to override, e.g. `[10, 7, 5, 3, 2, 1]`); anyone not placed scores 0. **Finish** ends it. | Most points, then most 1sts. If the top is tied, Finish waits for one more round. |
 
 Every format records the same things when tracking is on: the game, format,
@@ -225,11 +225,15 @@ Measurement `result` (configurable) with:
 | field | `players` | `Mum, Dad, Atlas, Miles` — everyone who took part |
 | field | `player_count` | `4` |
 | field | `standings` | `Dad=3-1, Mum=2-2, …` (round robin / Swiss W–L), `Dad=21, Mum=17` (free-for-all points), `Dad=5, Mum=2` (king of the hill wins on top). Absent for brackets. |
-| field | `top_wins` | King of the hill only: the champion's wins while holding the hill |
+| field | `top_wins` | King of the hill only: the king's wins while holding the hill |
+| field | `games`, `sessions`, `last_played` | King of the hill only: running totals for the lineage and when it was last played |
+| field | `state` | King of the hill only: the snapshot the card uses to continue the lineage (players, king, queue, totals) |
 
 The point's timestamp is when the tournament was started. That means correcting
 a mis-tap after the champion was decided re-records over the same point rather
-than adding a duplicate. Because it's plain InfluxDB data, Grafana can chart it
+than adding a duplicate — and a continued king-of-the-hill lineage keeps
+updating its one point (`last_played` says when), so the history shows the
+current king rather than a row per evening. Because it's plain InfluxDB data, Grafana can chart it
 too: query `SELECT "winner", "runner_up", "game", "mode" FROM "result"` as a
 table and use a *Group by* transform on `winner`, or count one player at a time
 with `SELECT count("winner") FROM "result" WHERE "winner" = 'Eve'`. (Winner is a

@@ -186,19 +186,52 @@ export function swiss(players, w = '', opts = {}) {
  * (A-Z then a-z, see kothChallengerCode) and '1' the king held / '2' the
  * challenger took over. A `w` of bare 1/2 digits is the older form where
  * the queue always chose the challenger. Open-ended — `finished` ends it.
- * Ranked by wins while king (the stat that matters here), then whoever
- * currently holds the hill, then total wins.
+ *
+ * A lineage can span sessions: `base` is a snapshot of where the previous
+ * session left off (king, queue order, per-player totals, games played),
+ * produced by kothSnapshot(). The champion is whoever holds the hill;
+ * standings rank by wins while king, then the holder, then total wins.
  */
 const KOTH_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 export const KOTH_MAX_PLAYERS = KOTH_LETTERS.length;
 export function kothChallengerCode(idx) { return KOTH_LETTERS[idx]; }
 
-export function kingOfTheHill(players, w = '', finished = false) {
+// Compact carry-over: { k: king idx, q: [queue idxs], s: [[kingWins, wins,
+// losses, reigns, played] per player], g: games so far, n: sessions so far }.
+export function kothSnapshot(res) {
+  const byIdx = [...res.standings].sort((a, b) => a.idx - b.idx);
+  return {
+    k: res.king, q: [...res.queue],
+    s: byIdx.map((x) => [x.kingWins, x.wins, x.losses, x.reigns, x.played]),
+    g: res.totalGames, n: res.sessions,
+  };
+}
+
+function validBase(base, n) {
+  return base && Number.isInteger(base.k) && base.k >= 0 && base.k < n
+    && Array.isArray(base.q) && Array.isArray(base.s) && base.s.length === n;
+}
+
+export function kingOfTheHill(players, w = '', finished = false, base = null) {
   const n = players.length;
   const stats = players.map((name, idx) => ({ idx, name, kingWins: 0, wins: 0, losses: 0, reigns: 0, played: 0 }));
-  const queue = players.map((_, i) => i);
-  let king = queue.shift();
-  stats[king].reigns++;
+  let queue = players.map((_, i) => i);
+  let king;
+  let priorGames = 0, sessions = 1;
+  if (validBase(base, n)) {
+    king = base.k;
+    queue = base.q.filter((i) => Number.isInteger(i) && i >= 0 && i < n && i !== king);
+    for (const i of players.keys()) if (i !== king && !queue.includes(i)) queue.push(i);
+    base.s.forEach((row, i) => {
+      const [kingWins = 0, wins = 0, losses = 0, reigns = 0, played = 0] = row || [];
+      Object.assign(stats[i], { kingWins, wins, losses, reigns, played });
+    });
+    priorGames = Number.isInteger(base.g) ? base.g : 0;
+    sessions = (Number.isInteger(base.n) ? base.n : 1) + 1;
+  } else {
+    king = queue.shift();
+    stats[king].reigns++;
+  }
   const games = [];
   const codes = typeof w === 'string' ? w : '';
   const legacy = codes.length > 0 && !/[A-Za-z]/.test(codes);
@@ -217,7 +250,7 @@ export function kingOfTheHill(players, w = '', finished = false) {
     if ((c !== '1' && c !== '2') || challenger == null || challenger < 0 || challenger >= n
         || challenger === king) break;
     queue.splice(queue.indexOf(challenger), 1);
-    const game = { n: games.length + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
+    const game = { n: priorGames + games.length + 1, king, challenger, winner: c === '1' ? 'king' : 'challenger' };
     games.push(game);
     stats[king].played++; stats[challenger].played++;
     if (c === '1') {
@@ -233,9 +266,16 @@ export function kingOfTheHill(players, w = '', finished = false) {
     || (b.idx === king) - (a.idx === king) || b.wins - a.wins || cmpName(a, b));
   // Default challenger = longest wait; `queue` (in wait order) is the menu.
   const current = finished ? null : { king, challenger: queue[0] };
-  const champion = finished && games.length > 0
-    ? { name: standings[0].name, runnerUp: standings[1] ? standings[1].name : null } : null;
-  return { kind: 'koth', players, games, king, queue: [...queue], current, standings, finished, complete: finished, tie: null, champion, n };
+  const totalGames = priorGames + games.length;
+  // The hill's holder is the champion; runner-up is the best of the rest.
+  const rest = standings.filter((x) => x.idx !== king);
+  const champion = finished && totalGames > 0
+    ? { name: players[king], runnerUp: rest.length ? rest[0].name : null } : null;
+  return {
+    kind: 'koth', players, games, king, queue: [...queue], current, standings,
+    finished, complete: finished, tie: null, champion, n, totalGames, sessions,
+    kingWins: stats[king].kingWins,
+  };
 }
 
 /* ======================= free-for-all ======================= */
