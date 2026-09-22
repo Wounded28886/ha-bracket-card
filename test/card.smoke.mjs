@@ -8,7 +8,11 @@ globalThis.window = window;
 globalThis.document = window.document;
 globalThis.HTMLElement = window.HTMLElement;
 globalThis.customElements = window.customElements;
-globalThis.setTimeout = window.setTimeout || setTimeout;
+// Keep Node's own timers (jsdom's setTimeout delegates back to the global and
+// would recurse). Run rAF callbacks synchronously so the connector-line pass
+// executes inside the test; jsdom has no layout, so it draws zero-length paths.
+globalThis.requestAnimationFrame = (f) => { f(); return 0; };
+globalThis.SVGElement = window.SVGElement;
 // jsdom lacks color-mix but never evaluates CSS values in JS, so nothing to shim.
 
 let pass = 0, fail = 0;
@@ -58,6 +62,18 @@ el.hass = makeHass(saved);
 ok(!el.shadowRoot.querySelector('#draft'), 'setup gone after creation');
 ok(el.shadowRoot.querySelectorAll('.section').length >= 2, 'winners + losers sections rendered');
 ok(!!el.shadowRoot.querySelector('#new'), 'New bracket button shown');
+
+// New layout: 5 players -> 2 real round-1 matches, 1 walkover, 1 hidden bye-vs-bye;
+// grand final in its own column on the right; connector SVG present.
+const r1 = [...el.shadowRoot.querySelectorAll('.section.wb .col')][0].querySelectorAll('.match');
+ok(r1.length === 4, `round 1 keeps 4 slots (got ${r1.length})`);
+ok([...r1].filter(m => m.classList.contains('hidden')).length === 1, 'exactly one bye-vs-bye slot hidden');
+ok([...r1].filter(m => m.querySelectorAll('.p.real').length === 2).length === 2, 'two real round-1 matches');
+ok(!!el.shadowRoot.querySelector('.bracket > .gf-col .match[data-id="GF-1"]'), 'grand final in right-hand column');
+ok(!el.shadowRoot.querySelector('.match[data-id="GF-2"]'), 'reset game not shown before it exists');
+ok(!!el.shadowRoot.querySelector('svg.lines path'), 'connector path drawn');
+// Names were shuffled: the stored order is a permutation of the input.
+ok([...parsed.p].sort().join() === ['Alice','Bob','Charlie','Dana','Eve'].join(), 'stored players are a permutation of the input');
 
 // Play the whole thing out by repeatedly clicking the first clickable name
 // until a champion banner appears (guard against infinite loop).

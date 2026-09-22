@@ -9,7 +9,11 @@ next time.
 
 - **Double elimination** — a losers bracket gives everyone a second chance, with
   an optional grand-final "bracket reset" game.
-- **Any number of players (2–64)** — odd counts get byes automatically.
+- **Any number of players (2–64)** — as many real first-round matches as
+  possible; only the leftover player (if any) gets a bye.
+- **Random draw** — the entered names are shuffled when the bracket is created.
+- **Connected bracket view** — winners and losers brackets with connector lines,
+  later rounds centred between their feeders, and the grand final on the right.
 - **Reusable** — nothing is hard-coded. New game night = new bracket in seconds.
 - **No custom integration, no Python** — a single frontend card. State lives in
   one `input_text` helper, so it survives restarts and is shared across every
@@ -77,6 +81,7 @@ title: Friday Game Night
 ### 3. Play
 
 1. Type player names into the setup box, one per line, and hit **Create bracket**.
+   The draw is randomised, so the order you type them in doesn't matter.
 2. Tap the winner of each match — the bracket fills the next rounds in as you go.
 3. When it's done, the 🏆 champion banner appears.
 4. **New bracket** clears it for the next game.

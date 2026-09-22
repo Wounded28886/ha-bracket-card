@@ -93,7 +93,7 @@ export function generateBracket(players, opts = {}) {
 
   // ---- Winners bracket ----
   const wb = []; // wb[r-1] = array of match ids
-  const order2seed = seedOrder(size);
+  const placement = round1Placement(names, size);
 
   for (let r = 1; r <= W; r++) {
     const count = wbMatchCount(size, r);
@@ -107,11 +107,9 @@ export function generateBracket(players, opts = {}) {
       });
       ids.push(id);
       if (r === 1) {
-        // Seed players into slots.
-        const seedA = order2seed[i * 2];
-        const seedB = order2seed[i * 2 + 1];
-        m.p1 = seedToParticipant(seedA, names);
-        m.p2 = seedToParticipant(seedB, names);
+        const [a, b] = placement[i];
+        m.p1 = a == null ? BYE() : { type: 'player', seed: a + 1, name: names[a] };
+        m.p2 = b == null ? BYE() : { type: 'player', seed: b + 1, name: names[b] };
       }
     }
     wb.push(ids);
@@ -228,18 +226,44 @@ export function generateBracket(players, opts = {}) {
   return resolve(state);
 }
 
-function seedToParticipant(seed, names) {
-  if (seed <= names.length) {
-    return { type: 'player', seed, name: names[seed - 1] };
+/*
+ * Round-1 slot layout that pushes byes as late as possible.
+ *
+ * Classic seeding (see seedOrder) hands every bye out in round 1, so 5 players
+ * in an 8-slot bracket produce a single real match and three walkovers. This
+ * instead plays as many full matches as the count allows, then at most one
+ * player-vs-bye, and fills what's left with bye-vs-bye (which the renderer
+ * hides). The non-full matches are interleaved with full ones so that each
+ * feeds a round-2 match alongside a real winner — so the player who sat out
+ * round 1 plays in round 2 rather than walking over twice in a row.
+ *
+ * Returns size/2 pairs of player indices; null means a bye in that slot.
+ */
+export function round1Placement(names, size) {
+  const n = names.length;
+  const full = Math.floor(n / 2);
+  const kinds = [];
+  for (let i = 0; i < full; i++) kinds.push([2 * i, 2 * i + 1]);
+  const nonFull = [];
+  if (n % 2 === 1) nonFull.push([n - 1, null]);
+  while (kinds.length + nonFull.length < size / 2) nonFull.push([null, null]);
+
+  // Interleave so every non-full match sits next to a full one in its
+  // round-2 pair. There are always at least as many full as non-full.
+  const out = [];
+  let f = 0, e = 0;
+  while (out.length < size / 2) {
+    if (f < kinds.length) out.push(kinds[f++]);
+    if (e < nonFull.length && out.length < size / 2) out.push(nonFull[e++]);
   }
-  return BYE();
+  return out;
 }
 
 // Is a slot a "real" player that can win?
 function isPlayer(ref) {
   return ref && ref.type === 'player';
 }
-function isBye(ref) {
+export function isBye(ref) {
   return ref && ref.type === 'bye';
 }
 

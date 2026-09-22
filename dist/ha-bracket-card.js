@@ -94,7 +94,7 @@ function generateBracket(players, opts = {}) {
 
   // ---- Winners bracket ----
   const wb = []; // wb[r-1] = array of match ids
-  const order2seed = seedOrder(size);
+  const placement = round1Placement(names, size);
 
   for (let r = 1; r <= W; r++) {
     const count = wbMatchCount(size, r);
@@ -108,11 +108,9 @@ function generateBracket(players, opts = {}) {
       });
       ids.push(id);
       if (r === 1) {
-        // Seed players into slots.
-        const seedA = order2seed[i * 2];
-        const seedB = order2seed[i * 2 + 1];
-        m.p1 = seedToParticipant(seedA, names);
-        m.p2 = seedToParticipant(seedB, names);
+        const [a, b] = placement[i];
+        m.p1 = a == null ? BYE() : { type: 'player', seed: a + 1, name: names[a] };
+        m.p2 = b == null ? BYE() : { type: 'player', seed: b + 1, name: names[b] };
       }
     }
     wb.push(ids);
@@ -229,11 +227,37 @@ function generateBracket(players, opts = {}) {
   return resolve(state);
 }
 
-function seedToParticipant(seed, names) {
-  if (seed <= names.length) {
-    return { type: 'player', seed, name: names[seed - 1] };
+/*
+ * Round-1 slot layout that pushes byes as late as possible.
+ *
+ * Classic seeding (see seedOrder) hands every bye out in round 1, so 5 players
+ * in an 8-slot bracket produce a single real match and three walkovers. This
+ * instead plays as many full matches as the count allows, then at most one
+ * player-vs-bye, and fills what's left with bye-vs-bye (which the renderer
+ * hides). The non-full matches are interleaved with full ones so that each
+ * feeds a round-2 match alongside a real winner — so the player who sat out
+ * round 1 plays in round 2 rather than walking over twice in a row.
+ *
+ * Returns size/2 pairs of player indices; null means a bye in that slot.
+ */
+function round1Placement(names, size) {
+  const n = names.length;
+  const full = Math.floor(n / 2);
+  const kinds = [];
+  for (let i = 0; i < full; i++) kinds.push([2 * i, 2 * i + 1]);
+  const nonFull = [];
+  if (n % 2 === 1) nonFull.push([n - 1, null]);
+  while (kinds.length + nonFull.length < size / 2) nonFull.push([null, null]);
+
+  // Interleave so every non-full match sits next to a full one in its
+  // round-2 pair. There are always at least as many full as non-full.
+  const out = [];
+  let f = 0, e = 0;
+  while (out.length < size / 2) {
+    if (f < kinds.length) out.push(kinds[f++]);
+    if (e < nonFull.length && out.length < size / 2) out.push(nonFull[e++]);
   }
-  return BYE();
+  return out;
 }
 
 // Is a slot a "real" player that can win?
@@ -392,7 +416,7 @@ function slotLabel(ref) {
  *   reset_bracket: true                       # optional, grand-final reset game
  */
 
-const CARD_VERSION = '1.0.1';
+const CARD_VERSION = '1.1.0';
 
 /* ---------- compact persistence ---------- */
 // Persisted form: {"v":2,"p":[names],"w":"codes","x":0|1}
@@ -448,6 +472,15 @@ function rebuild(players, resetBracket, decisions) {
 }
 
 function isRealPlayer(ref) { return ref && ref.type === 'player'; }
+
+// Fisher-Yates, in place.
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
 // All matches reachable downstream of `matchId` via winner/loser routing,
 // plus the grand-final reset game. Used to clear stale results on a re-pick.
@@ -538,6 +571,10 @@ class BracketCard extends HTMLElement {
     if (names.length < 2) { this._flash('Enter at least two players (one per line).'); return; }
     if (names.length > 64) { this._flash('That is a lot of players — cap is 64.'); return; }
     const resetBracket = this._config.reset_bracket !== false;
+    // Entry order is seeding order, and a typed list is rarely random — so
+    // shuffle once here. The shuffled order is what gets stored, so the
+    // bracket is stable from then on.
+    shuffle(names);
     const value = encodeState(names, resetBracket, {});
     if (value.length > 255 && /^input_text\./.test(this._config.entity)) {
       this._flash('Too much data for a 255-char input_text. Use shorter names, fewer players, or a "text" helper with a higher max.');
@@ -608,6 +645,29 @@ class BracketCard extends HTMLElement {
     `;
 
     this._wire(decoded);
+
+    // Connector lines are measured from laid-out positions, so they can only
+    // be drawn once the browser has done layout.
+    // Measuring forces layout, so the lines can be drawn right away; the
+    // next-frame pass catches late font metrics, and the observer handles
+    // resizes (e.g. the sidebar opening).
+    this._drawLines();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => this._drawLines());
+    this._observeResize();
+  }
+
+  // Every render replaces the DOM, so re-point the observer at the new element.
+  _observeResize() {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (this._ro) this._ro.disconnect();
+    const wrap = this.shadowRoot.querySelector('.bracket');
+    if (!wrap) return;
+    this._ro = this._ro || new ResizeObserver(() => this._drawLines());
+    this._ro.observe(wrap);
+  }
+
+  disconnectedCallback() {
+    if (this._ro) { this._ro.disconnect(); this._ro = null; }
   }
 
   _setupView() {
@@ -624,13 +684,14 @@ class BracketCard extends HTMLElement {
   _bracketView(decoded) {
     const { players, resetBracket, decisions } = decoded;
     const s = rebuild(players, resetBracket, decisions);
+    this._state = s; // _drawLines reads winnerTo routing from here
     const champ = champion(s);
 
-    // group matches
-    const groups = { W: {}, L: {}, GF: [] };
+    const groups = { W: {}, L: {} };
+    let gf1 = null, gf2 = null;
     for (const id of s.order) {
       const m = s.matches[id];
-      if (m.bracket === 'GF') { groups.GF.push(m); continue; }
+      if (m.bracket === 'GF') { if (m.id === 'GF-1') gf1 = m; else gf2 = m; continue; }
       (groups[m.bracket][m.round] ||= []).push(m);
     }
 
@@ -638,64 +699,115 @@ class BracketCard extends HTMLElement {
       ? `<div class="champ">🏆 Champion: <strong>${esc(champ.name)}</strong></div>`
       : ``;
 
+    // Every column stretches to the section's height and spreads its matches
+    // evenly, so a match in round r+1 sits centred between the two that feed
+    // it. Hidden (bye-vs-bye) matches keep their slot so that stays true.
     const section = (label, roundsObj, cls) => {
       const rounds = Object.keys(roundsObj).map(Number).sort((a, b) => a - b);
       if (!rounds.length) return '';
-      const cols = rounds.map((r) => {
-        const ms = roundsObj[r].map((m) => this._matchHtml(m)).join('');
-        return `<div class="col"><div class="col-h">${roundName(cls, r, rounds.length)}</div>${ms}</div>`;
-      }).join('');
-      return `<div class="section"><div class="sec-h ${cls}">${label}</div><div class="cols">${cols}</div></div>`;
+      const cols = rounds.map((r) => `
+        <div class="col">
+          <div class="col-h">${roundName(cls, r, rounds.length)}</div>
+          <div class="col-body">${roundsObj[r].map((m) => this._matchHtml(m)).join('')}</div>
+        </div>`).join('');
+      return `<div class="section ${cls}"><div class="sec-h ${cls}">${label}</div><div class="cols">${cols}</div></div>`;
     };
 
-    const gf = groups.GF.filter((m) => {
-      if (m.id === 'GF-2') {
-        // only show reset game if it's live (has players)
-        return isRealPlayer(m.p1) || isRealPlayer(m.p2);
-      }
-      return true;
-    });
-    const gfHtml = gf.length ? `
-      <div class="section">
+    // The reset game only exists once the losers-bracket entrant has won GF-1.
+    const showGf2 = gf2 && (isRealPlayer(gf2.p1) || isRealPlayer(gf2.p2));
+    const gfCol = `
+      <div class="gf-col">
         <div class="sec-h gf">Grand Final</div>
-        <div class="cols"><div class="col"><div class="col-h">&nbsp;</div>
-          ${gf.map((m) => this._matchHtml(m, m.id === 'GF-2' ? 'Reset game' : '')).join('')}
-        </div></div>
-      </div>` : '';
+        <div class="gf-body">
+          ${gf1 ? this._matchHtml(gf1) : ''}
+          ${showGf2 ? this._matchHtml(gf2, 'Reset game') : ''}
+        </div>
+      </div>`;
 
     return `
       ${champBanner}
       <div class="scroll">
-        ${section('Winners Bracket', groups.W, 'wb')}
-        ${section('Losers Bracket', groups.L, 'lb')}
-        ${gfHtml}
+        <div class="bracket">
+          <svg class="lines" aria-hidden="true"></svg>
+          <div class="left">
+            ${section('Winners Bracket', groups.W, 'wb')}
+            ${section('Losers Bracket', groups.L, 'lb')}
+          </div>
+          ${gfCol}
+        </div>
       </div>`;
   }
 
   _matchHtml(m, tag = '') {
+    // A match with a bye on both sides is scaffolding, not a game: it exists
+    // so the tree stays a power of two. Keep its slot (for centring) but
+    // don't show it.
+    const hidden = m.winner === 'bye' || (isBye(m.p1) && isBye(m.p2));
     const row = (side) => {
       const ref = m[side];
       const label = slotLabel(ref) || '&nbsp;';
       const real = isRealPlayer(ref);
       const isWinner = m.winner === side;
       const isLoser = m.winner && m.winner !== side && m.winner !== 'bye';
-      const cls = [
-        'p',
-        real ? 'real' : 'empty',
-        isWinner ? 'win' : '',
-        isLoser ? 'lose' : '',
-      ].join(' ').trim();
-      const clickable = real && !isWinner && (isRealPlayer(m.p1) && isRealPlayer(m.p2));
+      const cls = ['p', real ? 'real' : 'empty', isWinner ? 'win' : '', isLoser ? 'lose' : '']
+        .join(' ').trim();
+      const clickable = real && !isWinner && isRealPlayer(m.p1) && isRealPlayer(m.p2);
       return `<div class="${cls}" data-match="${m.id}" data-side="${side}" data-click="${clickable ? 1 : 0}">
                 <span class="nm">${label}</span>${isWinner ? '<span class="chk">✓</span>' : ''}
               </div>`;
     };
-    return `<div class="match">
+    return `<div class="match${hidden ? ' hidden' : ''}" data-id="${m.id}">
       ${tag ? `<div class="mtag">${esc(tag)}</div>` : ''}
       ${row('p1')}
       <div class="vs"></div>
       ${row('p2')}
     </div>`;
+  }
+
+  /*
+   * Draw the connectors as one SVG path over the bracket, measured from where
+   * the matches actually landed. Measuring (rather than a pure-CSS bracket)
+   * is what lets the lines survive hidden bye matches and the losers
+   * bracket's uneven wiring, and lets both finals converge on the grand
+   * final off to the right.
+   */
+  _drawLines() {
+    const root = this.shadowRoot;
+    const wrap = root && root.querySelector('.bracket');
+    const svg = root && root.querySelector('svg.lines');
+    const st = this._state;
+    if (!wrap || !svg || !st) return;
+
+    const els = new Map();
+    wrap.querySelectorAll('.match[data-id]').forEach((el) => els.set(el.dataset.id, el));
+    const visible = (id) => {
+      const el = els.get(id);
+      return el && !el.classList.contains('hidden') ? el : null;
+    };
+
+    const origin = wrap.getBoundingClientRect();
+    const segs = [];
+    const link = (fromId, toId) => {
+      const a = visible(fromId), b = visible(toId);
+      if (!a || !b) return;
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      const x1 = ra.right - origin.left, y1 = ra.top + ra.height / 2 - origin.top;
+      const x2 = rb.left - origin.left, y2 = rb.top + rb.height / 2 - origin.top;
+      if (x2 <= x1) return; // never draw backwards (e.g. a WB loser dropping down)
+      const xm = x1 + (x2 - x1) / 2;
+      segs.push(`M${x1},${y1}H${xm}V${y2}H${x2}`);
+    };
+
+    for (const id of st.order) {
+      const m = st.matches[id];
+      if (m.winnerTo) link(id, m.winnerTo.match);
+    }
+    // GF-1 -> GF-2 has no routing entry (it's created on demand), so add it.
+    if (visible('GF-2')) link('GF-1', 'GF-2');
+
+    svg.setAttribute('width', wrap.scrollWidth);
+    svg.setAttribute('height', wrap.scrollHeight);
+    svg.innerHTML = `<path d="${segs.join(' ')}" fill="none" stroke="var(--divider-color, #9e9e9e)" stroke-width="2" stroke-linejoin="round"/>`;
   }
 
   _wire(decoded) {
@@ -769,18 +881,30 @@ const STYLE = `
            color: var(--text-primary-color, #fff); font-size: 1.05rem; }
   .champ strong { font-weight: 700; }
   .scroll { overflow-x: auto; padding: 4px 12px 12px; }
-  .section { margin-top: 10px; }
+  /* Layout: winners + losers stacked on the left, grand final centred on the
+     right. Columns stretch to full height and space their matches evenly so
+     each later round sits centred between the matches feeding it. */
+  .bracket { position: relative; display: flex; align-items: stretch; gap: 28px;
+             min-width: min-content; }
+  .bracket .lines { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 0; }
+  .left { display: flex; flex-direction: column; gap: 14px; }
+  .section { display: flex; flex-direction: column; flex: 1; }
   .sec-h { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase;
            font-weight:700; margin: 6px 4px 2px; color: var(--secondary-text-color); }
   .sec-h.wb { color: var(--primary-color); }
   .sec-h.lb { color: var(--accent-color, #ff9800); }
   .sec-h.gf { color: var(--success-color, #43a047); }
-  .cols { display:flex; gap: 18px; align-items:flex-start; min-width: min-content; }
-  .col { display:flex; flex-direction:column; gap: 12px; min-width: 132px; }
+  .cols { display:flex; gap: 28px; align-items:stretch; flex: 1; }
+  .col { display:flex; flex-direction:column; min-width: 132px; }
   .col-h { font-size:.7rem; color: var(--disabled-text-color, #9e9e9e);
-           text-align:center; min-height: 1em; font-weight:600; }
-  .match { border:1px solid var(--divider-color, #e0e0e0); border-radius: 8px;
-           overflow: hidden; background: var(--card-background-color); }
+           text-align:center; min-height: 1em; font-weight:600; margin-bottom: 4px; }
+  .col-body { flex:1; display:flex; flex-direction:column; justify-content:space-around;
+              gap: 12px; }
+  .gf-col { display:flex; flex-direction:column; min-width: 132px; }
+  .gf-body { flex:1; display:flex; flex-direction:column; justify-content:center; gap: 12px; }
+  .match.hidden { visibility: hidden; }
+  .match { position: relative; z-index: 1; border:1px solid var(--divider-color, #e0e0e0);
+           border-radius: 8px; overflow: hidden; background: var(--card-background-color); }
   .mtag { font-size:.6rem; text-transform:uppercase; letter-spacing:.06em;
           text-align:center; padding:2px; color: var(--secondary-text-color);
           background: var(--secondary-background-color); }

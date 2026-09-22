@@ -56,26 +56,49 @@ section('routing wiring');
   assert(wbFinal.loserTo && wbFinal.loserTo.match === 'L4-1', 'WB final loser -> L4-1');
 }
 
-// ---- bye propagation (n=5 -> size 8, 3 byes) ----
+// ---- bye placement: byes as late as possible, spread fairly ----
 section('bye handling (n=5)');
 {
-  const names = ['A','B','C','D','E'];
+  const s = generateBracket(['A','B','C','D','E']);
+  const r1 = s.order.map((id) => s.matches[id]).filter((m) => m.bracket === 'W' && m.round === 1);
+  const kind = (m) => {
+    const a = m.p1 && m.p1.type, b = m.p2 && m.p2.type;
+    if (a === 'player' && b === 'player') return 'full';
+    if (a === 'bye' && b === 'bye') return 'empty';
+    return 'walkover';
+  };
+  const kinds = r1.map(kind);
+  assert(kinds.filter((k) => k === 'full').length === 2, `2 real R1 matches for 5 players (got ${JSON.stringify(kinds)})`);
+  assert(kinds.filter((k) => k === 'walkover').length === 1, 'exactly one player sits out R1');
+  assert(kinds.filter((k) => k === 'empty').length === 1, 'the remaining slot pair is an empty (hidden) match');
+  // Each non-full match must share its round-2 pair with a full match, so the
+  // R1 bye player faces a real winner in R2 instead of walking over twice.
+  for (let i = 0; i < r1.length; i += 2) {
+    const pair = [kinds[i], kinds[i + 1]];
+    assert(pair.includes('full'), `R2 pair ${i / 2} contains a real match (got ${pair})`);
+  }
+  // Play the real R1 matches; R2 then has exactly one real match and one
+  // walkover — the R1 bye player faces a winner, the other winner sits out.
+  for (const m of r1) if (kind(m) === 'full') setWinner(s, m.id, 'p1');
+  const r2 = s.order.map((id) => s.matches[id]).filter((m) => m.bracket === 'W' && m.round === 2);
+  const r2kinds = r2.map(kind);
+  assert(r2kinds.filter((k) => k === 'full').length === 1, `1 real R2 match (got ${JSON.stringify(r2kinds)})`);
+  assert(r2kinds.filter((k) => k === 'walkover').length === 1, '1 R2 walkover');
+}
+
+section('bye placement across sizes');
+for (const n of [2, 3, 4, 5, 6, 7, 9, 12, 13]) {
+  const names = Array.from({ length: n }, (_, i) => 'P' + (i + 1));
   const s = generateBracket(names);
-  // Count real players auto-advanced in WB round 1.
-  let r1decided = 0;
-  for (const id of s.order) {
-    const m = s.matches[id];
-    if (m.bracket === 'W' && m.round === 1 && m.winner && m.winner !== 'bye') r1decided++;
-  }
-  assert(r1decided === 3, `3 R1 byes auto-advance real players (got ${r1decided})`);
-  // No match ever pairs bye vs bye in round 1.
-  let byeVbye = 0;
-  for (const id of s.order) {
-    const m = s.matches[id];
-    if (m.bracket === 'W' && m.round === 1 && m.p1 && m.p2 &&
-        m.p1.type === 'bye' && m.p2.type === 'bye') byeVbye++;
-  }
-  assert(byeVbye === 0, 'no bye-vs-bye in WB round 1');
+  const r1 = s.order.map((id) => s.matches[id]).filter((m) => m.bracket === 'W' && m.round === 1);
+  const full = r1.filter((m) => m.p1.type === 'player' && m.p2.type === 'player').length;
+  const walk = r1.filter((m) => (m.p1.type === 'player') !== (m.p2.type === 'player')).length;
+  assert(full === Math.floor(n / 2), `n=${n}: R1 has floor(n/2)=${Math.floor(n / 2)} real matches (got ${full})`);
+  assert(walk === n % 2, `n=${n}: R1 has ${n % 2} walkover(s) (got ${walk})`);
+  // Every player appears exactly once in R1.
+  const seen = new Set();
+  for (const m of r1) for (const p of [m.p1, m.p2]) if (p.type === 'player') seen.add(p.name);
+  assert(seen.size === n, `n=${n}: every player placed once`);
 }
 
 // ---- full playthrough: seed 1 wins everything (n=8) ----
