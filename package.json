@@ -1,11 +1,18 @@
 {
   "name": "ha-bracket-card",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Reusable double-elimination tournament bracket card for Home Assistant.",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
     "test": "node test/bracket.test.mjs && node test/card.smoke.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wounded28886/ha-bracket-card"
+  }
 }

@@ -27,7 +27,7 @@ This is distributed as a **HACS custom repository** (dashboard/plugin type).
 1. In Home Assistant, open **HACS**.
 2. Top-right **⋮ menu → Custom repositories**.
 3. Add the repository:
-   - **Repository:** `https://github.com/<your-username>/ha-bracket-card`
+   - **Repository:** `https://github.com/Wounded28886/ha-bracket-card`
    - **Type:** `Dashboard`
 4. Find **Bracket Card** in the HACS list, open it, and click **Download**.
 5. **Restart Home Assistant** (or reload resources) when prompted.

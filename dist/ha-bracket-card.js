@@ -392,7 +392,7 @@ function slotLabel(ref) {
  *   reset_bracket: true                       # optional, grand-final reset game
  */
 
-const CARD_VERSION = '1.0.0';
+const CARD_VERSION = '1.0.1';
 
 /* ---------- compact persistence ---------- */
 // Persisted form: {"v":2,"p":[names],"w":"codes","x":0|1}
@@ -508,23 +508,27 @@ class BracketCard extends HTMLElement {
   getCardSize() { return 8; }
 
   /* --- persistence helper --- */
-  _save(players, resetBracket, decisions) {
-    const value = encodeState(players, resetBracket, decisions);
-    this._lastRaw = value; // optimistic; avoids a flash before HA echoes back
-    this._hass.callService('input_text', 'set_value', {
+  // `input_text` and `text` entities are written with different services;
+  // the domain of the configured entity decides which.
+  _setValue(value) {
+    const domain = this._config.entity.split('.')[0];
+    this._hass.callService(domain, 'set_value', {
       entity_id: this._config.entity,
       value,
     });
+  }
+
+  _save(players, resetBracket, decisions) {
+    const value = encodeState(players, resetBracket, decisions);
+    this._lastRaw = value; // optimistic; avoids a flash before HA echoes back
+    this._setValue(value);
     this._render(); // optimistic; HA will echo the same value and be a no-op
   }
 
   _clear() {
     this._confirmReset = false;
     this._lastRaw = '';
-    this._hass.callService('input_text', 'set_value', {
-      entity_id: this._config.entity,
-      value: '',
-    });
+    this._setValue('');
     this._render();
   }
 
