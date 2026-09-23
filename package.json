@@ -1,11 +1,11 @@
 {
   "name": "ha-bracket-card",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "description": "Game-night tournament cards for Home Assistant (HACS) and a standalone Docker server.",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node test/bracket.test.mjs && node test/formats.test.mjs && node test/card.smoke.mjs && node test/server.test.mjs",
+    "test": "node test/bracket.test.mjs && node test/formats.test.mjs && node test/stats.test.mjs && node test/card.smoke.mjs && node test/server.test.mjs",
     "serve": "node server/server.mjs",
     "docker:build": "docker build -t ha-bracket-card ."
   },

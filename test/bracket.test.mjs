@@ -1,6 +1,6 @@
 import {
   generateBracket, setWinner, champion, resolve,
-  nextPow2, seedOrder, slotLabel,
+  nextPow2, seedOrder, slotLabel, eliminationOrder,
 } from '../src/bracket.js';
 
 let pass = 0, fail = 0;
@@ -166,6 +166,56 @@ section('single elimination');
     assert(c && c.name === 'P1', `n=${n}: favourite wins single-elim (got ${c && c.name})`);
     assert(c.runnerUp && c.runnerUp !== 'P1', `n=${n}: runner-up reported`);
   }
+}
+
+// ---- finishing order ----
+section('finishing order');
+{
+  // Single elimination: the further you get, the higher you finish.
+  const names = ['A', 'B', 'C', 'D'];
+  let s = generateBracket(names, { single: true });
+  s = playOut(s, favouriteLower);
+  const order = eliminationOrder(s);
+  assert(order.length === 4 && new Set(order).size === 4, `everyone placed once (${order})`);
+  const sChamp = champion(s);
+  assert(order[0] === sChamp.name && order[1] === sChamp.runnerUp,
+    `champion then the player who lost the final (${order})`);
+  const firstRoundLosers = ['A', 'B', 'C', 'D'].filter((n) => n !== order[0] && n !== order[1]);
+  assert(order.slice(2).sort().join() === firstRoundLosers.sort().join(),
+    `the two first-round losers finish last (${order})`);
+
+  // Double elimination: a winners-bracket loss is not an elimination.
+  let d = generateBracket(names);
+  d = playOut(d, favouriteLower);
+  const dOrder = eliminationOrder(d);
+  assert(dOrder.length === 4 && new Set(dOrder).size === 4, `double: everyone placed once (${dOrder})`);
+  assert(dOrder[0] === champion(d).name, 'double: champion first');
+  assert(dOrder[1] === champion(d).runnerUp, `double: runner-up second (${dOrder})`);
+
+  // With a bracket reset, the runner-up is whoever loses the reset game —
+  // not the loser of the first grand final, who is the champion.
+  let r = generateBracket(names);
+  r = playOut(r, favouriteLower, { stopAt: 'GF-1' });
+  r = setWinner(r, 'GF-1', 'p2');            // losers-bracket entrant forces a reset
+  r = setWinner(r, 'GF-2', 'p1');            // and loses it
+  const champ = champion(r);
+  const rOrder = eliminationOrder(r);
+  assert(rOrder[0] === champ.name && rOrder[1] === champ.runnerUp,
+    `reset: champion then the reset game's loser (${rOrder})`);
+  assert(new Set(rOrder).size === 4, 'reset: nobody placed twice');
+
+  // An unfinished bracket still ranks everyone, survivors last.
+  const part = generateBracket(names);
+  const partOrder = eliminationOrder(part);
+  assert(partOrder.length === 4 && new Set(partOrder).size === 4,
+    `unfinished: everyone still listed (${partOrder})`);
+
+  // Byes don't earn a placing of their own.
+  let odd = generateBracket(['A', 'B', 'C', 'D', 'E'], { single: true });
+  odd = playOut(odd, favouriteLower);
+  const oddOrder = eliminationOrder(odd);
+  assert(oddOrder.length === 5 && new Set(oddOrder).size === 5 && !oddOrder.includes('BYE'),
+    `odd counts place exactly the real players (${oddOrder})`);
 }
 
 // ---- idempotent resolve ----

@@ -11,8 +11,9 @@ container talks to nobody; every phone, tablet and TV just opens its URL.
 - **Six formats** — double elimination, single elimination, round robin, Swiss
   system, king of the hill and free-for-all (points race).
 - **Ongoing titles** — each game (UNO, Mario Kart…) keeps one king-of-the-hill
-  champion that carries across evenings, plus a full result history and a wins
-  leaderboard.
+  champion that carries across evenings.
+- **A Hall of Fame** — a belt per game, season tables with points and ratings,
+  a head-to-head grid, rivalries, form and streaks, and a page per player.
 - **Everything in one file** — `/data/store.json` holds the tournament in
   progress and every result. Copy it and you have a backup; delete it and you
   start fresh.

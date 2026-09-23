@@ -28,9 +28,10 @@ Run it either way — the board itself is the same code in both:
   downstream that depended on it is cleared automatically.
 - **Game name** — type what you're playing (Mario Kart, UNO…) when you set up
   the bracket; it's shown next to the title.
-- **Optional result tracking** — record each champion in InfluxDB and show the
-  current champion, past winners and a leaderboard with the companion
-  `bracket-history-card`.
+- **Optional result tracking** — record every result and the companion
+  `bracket-history-card` turns them into a Hall of Fame: a title per game,
+  season tables, ratings, head-to-head and a page per player. See
+  [The Hall of Fame](#the-hall-of-fame).
 - Follows your Home Assistant theme (light and dark).
 
 ---
@@ -234,6 +235,53 @@ tracking:
 | `entity`   | string  | —              | The bracket helper; the card reloads whenever it changes |
 | `limit`    | number  | `100`          | Most recent results to fetch                             |
 | `game`     | string  | —              | Preselect the game filter                                |
+| `view`     | string  | `champions`    | Which tab opens first: `champions`, `league`, `h2h` or `history` |
+| `sort`     | string  | `wins`         | Leaderboard order: `wins`, `rate`, `points` or `rating`  |
+
+## The Hall of Fame
+
+Every recorded result feeds four views, and every name in any of them opens
+that player's own page.
+
+**Champions.** A **title per game** across the top — whoever won UNO last
+holds the UNO belt until somebody takes it off them, with how many times
+they've defended it and who they took it from. Then the current season's
+leader, and the leaderboard: wins, runner-up finishes, how often each player
+turned up, **win rate**, points and rating. A run of wins earns a 🔥 badge;
+four events without one earns a dry spell. Five dots show recent form at a
+glance. Finally, **on this day** — what happened a year ago tonight.
+
+**League.** A table per season, ordered by points, so last year's dominance
+doesn't sit on top of this year's board for ever. Below it, a breakdown **by
+format** (who wins knockouts, who wins points races) and the **biggest
+fields** anyone has won.
+
+**Head to head.** A grid of who has beaten whom in a final, green where
+you're ahead and red where you're behind, plus a **rivalries** list ordered by
+how often each pair has met.
+
+**History.** Every result, newest first, with the full finishing order.
+
+**A player's page** collects it all for one person: wins and win rate, points,
+rating, best field, form and streak, their record **by game** and **by
+format**, who beats them most and who they beat most, and their recent
+placings.
+
+### How points and ratings work
+
+**Points** reward beating more people: a placing in a field of *n* is worth
+*n − place + 1*, so winning a six-player night is six points and winning a
+two-player one is two. Season tables are ordered by points.
+
+**Ratings** start at 1000 and move only with who you beat. One tournament is
+treated as every pair of its players at once — finishing above someone counts
+as a win against them — and each pair can move a rating by at most a fixed
+step, so a big field doesn't swing ratings harder than a small one, it just
+settles them faster. Turning up and losing doesn't cost you much; losing to
+people you should beat does.
+
+Both are computed from the rows at display time, so **they apply to results
+you have already recorded** — nothing needs re-entering.
 
 ### What gets stored
 
@@ -248,10 +296,15 @@ Measurement `result` (configurable) with:
 | field | `players` | `Mum, Dad, Atlas, Miles` — everyone who took part |
 | field | `player_count` | `4` |
 | field | `standings` | `Dad=3-1, Mum=2-2, …` (round robin / Swiss W–L), `Dad=21, Mum=17` (free-for-all points), `Dad=5, Mum=2` (king of the hill wins on top). Absent for brackets. |
+| field | `placings` | The full finishing order, best first — what the season points and ratings are built from. A bracket ranks by how long you lasted; every other format uses its own final standings. |
 | field | `top_wins` | King of the hill only: the king's wins while holding the hill |
 | field | `games`, `sessions`, `last_played` | King of the hill only: running totals for the title and when it was last played |
 | field | `state` | King of the hill only: the snapshot the card uses to continue the title (players, king, queue, totals) |
 | field | `temp` | `true` on a one-off king-of-the-hill game — it never becomes the game's ongoing title |
+
+Results recorded before `placings` existed still count everywhere: the card
+treats them as "winner first, runner-up second, everyone else level", which is
+all those rows actually knew.
 
 The point's timestamp is when the tournament was started. That means correcting
 a mis-tap after the champion was decided re-records over the same point rather
@@ -327,6 +380,9 @@ npm run build     # bundle src/ -> dist/ha-bracket-card.js
   in `test/bracket.test.mjs`.
 - `src/formats.js` — round robin, Swiss, king of the hill, free-for-all logic.
   Unit-tested in `test/formats.test.mjs`.
+- `src/stats.js` — what the recorded results add up to: belts, seasons,
+  leaderboards, points, ratings, head-to-head, streaks. Pure functions over
+  the rows, unit-tested in `test/stats.test.mjs`.
 - `src/card.js` — the Lovelace custom elements (both cards).
 - `dist/ha-bracket-card.js` — the bundled file HACS serves. **Generated** — run
   `npm run build` after editing `src/`.

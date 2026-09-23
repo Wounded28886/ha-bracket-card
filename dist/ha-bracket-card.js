@@ -419,6 +419,45 @@ function slotLabel(ref) {
 }
 
 /*
+ * Finishing order, best first.
+ *
+ * Placing in a bracket is "how long you lasted": whoever is eliminated last
+ * finishes highest. `state.order` is topological — winners bracket, then
+ * losers bracket, then the grand final — so walking it backwards visits
+ * eliminations from last to first.
+ *
+ * In double elimination a loss in the winners bracket isn't an elimination
+ * (you drop into the losers bracket), so only losers-bracket and grand-final
+ * losses count. The champion is excluded, which also disposes of the grand
+ * final's first game: when a reset is played its loser is the champion, and
+ * the real runner-up falls out of the reset game instead.
+ *
+ * Players still alive (an unfinished tournament) come last, in seed order.
+ */
+function eliminationOrder(state) {
+  const champ = champion(state);
+  const order = [];
+  const seen = new Set();
+  if (champ) { order.push(champ.name); seen.add(champ.name); }
+
+  for (let i = state.order.length - 1; i >= 0; i--) {
+    const match = state.matches[state.order[i]];
+    if (!match.winner || match.winner === 'bye') continue;
+    // A winners-bracket loss only eliminates when there's nowhere to drop to.
+    if (match.bracket === 'W' && !state.single && state.matches['GF-1']) continue;
+    const loser = match.winner === 'p1' ? match.p2 : match.p1;
+    if (!isPlayer(loser) || seen.has(loser.name)) continue;
+    seen.add(loser.name);
+    order.push(loser.name);
+  }
+
+  for (const name of state.players) {
+    if (!seen.has(name)) { seen.add(name); order.push(name); }
+  }
+  return order;
+}
+
+/*
  * ha-bracket-card — non-bracket tournament formats
  *
  * Pure, dependency-free logic for round robin, Swiss, king of the hill and
@@ -618,7 +657,7 @@ function swiss(players, w = '', opts = {}) {
  * holder, then total wins.
  */
 const KOTH_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-export const KOTH_MAX_PLAYERS = KOTH_LETTERS.length;
+const KOTH_MAX_PLAYERS = KOTH_LETTERS.length;
 function kothChallengerCode(idx) { return KOTH_LETTERS[idx]; }
 
 // Compact carry-over: { k: king idx, q: [queue idxs], s: [[kingWins, wins,
@@ -799,6 +838,406 @@ function standingsSummary(result) {
 }
 
 /*
+ * ha-bracket-card — what the recorded results add up to.
+ *
+ * Pure functions over the rows the history card reads back: no DOM, no
+ * network, no dates beyond the ones in the data. Everything here works on
+ * results recorded by any version — rows written before full finishing
+ * orders existed fall back to "winner first, runner-up second, everyone
+ * else level" — so the whole history counts, not just what came after.
+ *
+ * A row looks like:
+ *   { time, game, mode, winner, runner_up, players, player_count,
+ *     placings?, standings?, top_wins?, temp? }
+ *
+ * Unit-tested in test/stats.test.mjs.
+ */
+
+const SEP = /\s*,\s*/;
+
+const splitNames = (value) =>
+  String(value || '').split(SEP).map((n) => n.trim()).filter(Boolean);
+
+/* A one-off king-of-the-hill game doesn't hold a title or count as a win. */
+const isReal = (row) => row && row.temp !== true && !!row.winner;
+
+const realRows = (rows) => (rows || []).filter(isReal);
+
+/* Newest first, which is how the card wants nearly everything. */
+const byNewest = (rows) => [...rows].sort((a, b) => b.time - a.time);
+
+function rowDate(row) {
+  const d = new Date((row.time || 0) * 1000);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+const seasonOf = (row) => {
+  const d = rowDate(row);
+  return d ? d.getFullYear() : null;
+};
+
+/*
+ * Who finished where, as [{name, rank}] with ties sharing a rank.
+ *
+ * Uses the recorded finishing order when there is one. Older rows only know
+ * the top two, so everyone else is ranked joint third — enough for points
+ * and ratings to treat them fairly without inventing an order.
+ */
+function ranked(row) {
+  const players = splitNames(row.players);
+  const placings = splitNames(row.placings);
+  if (placings.length) {
+    const known = placings.map((name, i) => ({ name, rank: i + 1 }));
+    // Anyone missing from the order (shouldn't happen) trails the field.
+    for (const name of players) {
+      if (!known.some((k) => k.name === name)) known.push({ name, rank: known.length + 1 });
+    }
+    return known;
+  }
+  const out = [];
+  if (row.winner) out.push({ name: row.winner, rank: 1 });
+  if (row.runner_up) out.push({ name: row.runner_up, rank: 2 });
+  const rest = players.filter((n) => n !== row.winner && n !== row.runner_up);
+  for (const name of rest) out.push({ name, rank: 3 });
+  return out;
+}
+
+const participants = (row) => {
+  const players = splitNames(row.players);
+  if (players.length) return players;
+  return ranked(row).map((r) => r.name);
+};
+
+/* ---------------------------------------------------------------- belts */
+/*
+ * One title per game, held by whoever won it last. Losing it needs someone
+ * else to win that game — which is what makes it worth defending.
+ */
+function belts(rows) {
+  const byGame = new Map();
+  for (const row of byNewest(realRows(rows))) {
+    const game = row.game || 'Untitled';
+    let belt = byGame.get(game);
+    if (!belt) {
+      belt = {
+        game,
+        holder: row.winner,
+        since: row.time,
+        wonAt: row.time,
+        defences: 0,
+        mode: row.mode,
+        lastPlayed: row.last_played || row.time,
+        previous: null,
+      };
+      byGame.set(game, belt);
+      continue;
+    }
+    // Rows arrive newest first: keep counting back while the same person
+    // keeps winning, and stop at the game they took it in.
+    if (belt.previous === null) {
+      if (row.winner === belt.holder) {
+        belt.defences += 1;
+        belt.since = row.time;
+      } else {
+        belt.previous = row.winner;
+      }
+    }
+  }
+  return [...byGame.values()].sort((a, b) => b.wonAt - a.wonAt);
+}
+
+/* --------------------------------------------------------------- points */
+/*
+ * A placing in a field of n is worth n - place + 1: winning six players is
+ * six points, last is one. Beating more people is worth more, which is the
+ * whole reason to record the field size.
+ */
+function pointsFor(rank, fieldSize) {
+  return Math.max(1, fieldSize - rank + 1);
+}
+
+/* ------------------------------------------------------------------ elo */
+/*
+ * One tournament is every pair of its players compared at once: finishing
+ * above someone counts as a win against them, level counts as a draw. Each
+ * pair moves the rating by at most K/(n-1), so a big field doesn't swing
+ * ratings more than a small one — it just settles them faster.
+ */
+const ELO_START = 1000;
+const ELO_K = 32;
+
+function elo(rows, { start = ELO_START, k = ELO_K } = {}) {
+  const ratings = new Map();
+  const get = (name) => (ratings.has(name) ? ratings.get(name) : start);
+  const history = [];
+
+  for (const row of [...realRows(rows)].sort((a, b) => a.time - b.time)) {
+    const places = ranked(row);
+    if (places.length < 2) continue;
+    const before = new Map(places.map((p) => [p.name, get(p.name)]));
+    const delta = new Map(places.map((p) => [p.name, 0]));
+    const perPair = k / (places.length - 1);
+
+    for (let i = 0; i < places.length; i++) {
+      for (let j = i + 1; j < places.length; j++) {
+        const a = places[i], b = places[j];
+        if (a.name === b.name) continue;
+        const ra = before.get(a.name), rb = before.get(b.name);
+        const expected = 1 / (1 + 10 ** ((rb - ra) / 400));
+        const score = a.rank === b.rank ? 0.5 : a.rank < b.rank ? 1 : 0;
+        delta.set(a.name, delta.get(a.name) + perPair * (score - expected));
+        delta.set(b.name, delta.get(b.name) + perPair * ((1 - score) - (1 - expected)));
+      }
+    }
+    for (const [name, d] of delta) ratings.set(name, get(name) + d);
+    history.push({
+      time: row.time,
+      game: row.game,
+      ratings: Object.fromEntries([...ratings].map(([n, r]) => [n, Math.round(r)])),
+    });
+  }
+  return {
+    ratings: Object.fromEntries([...ratings].map(([n, r]) => [n, Math.round(r)])),
+    history,
+  };
+}
+
+/* ---------------------------------------------------------- leaderboard */
+/*
+ * Everything known about each player, from every angle the card shows:
+ * wins and how often they turned up, points, rating, form, streaks, the
+ * games they're best and worst at, and who they beat most.
+ */
+function leaderboard(rows, opts = {}) {
+  const live = realRows(rows);
+  const scoped = opts.season ? live.filter((r) => seasonOf(r) === opts.season) : live;
+  const ordered = [...scoped].sort((a, b) => a.time - b.time);
+  const ratings = elo(live).ratings;   // rating is a career thing, not per season
+
+  const table = new Map();
+  const player = (name) => {
+    if (!table.has(name)) {
+      table.set(name, {
+        name, wins: 0, runnerUps: 0, appearances: 0, points: 0,
+        firstPlayed: null, lastPlayed: null, lastWin: null,
+        bestField: 0, byGame: new Map(), byMode: new Map(),
+        beat: new Map(), lostTo: new Map(), results: [],
+      });
+    }
+    return table.get(name);
+  };
+
+  for (const row of ordered) {
+    const places = ranked(row);
+    const field = Math.max(places.length, Number(row.player_count) || 0);
+    for (const { name, rank } of places) {
+      const p = player(name);
+      p.appearances += 1;
+      p.points += pointsFor(rank, field);
+      p.firstPlayed = p.firstPlayed === null ? row.time : Math.min(p.firstPlayed, row.time);
+      p.lastPlayed = p.lastPlayed === null ? row.time : Math.max(p.lastPlayed, row.time);
+      p.results.push({ time: row.time, game: row.game, mode: row.mode, rank, won: rank === 1, field });
+
+      const game = row.game || 'Untitled';
+      const g = p.byGame.get(game) || { game, wins: 0, played: 0 };
+      g.played += 1;
+      const mode = row.mode || 'unknown';
+      const m = p.byMode.get(mode) || { mode, wins: 0, played: 0 };
+      m.played += 1;
+
+      if (rank === 1) {
+        p.wins += 1;
+        p.lastWin = row.time;
+        p.bestField = Math.max(p.bestField, field);
+        g.wins += 1;
+        m.wins += 1;
+        if (row.runner_up) p.beat.set(row.runner_up, (p.beat.get(row.runner_up) || 0) + 1);
+      }
+      if (rank === 2 && row.winner) {
+        p.runnerUps += 1;
+        p.lostTo.set(row.winner, (p.lostTo.get(row.winner) || 0) + 1);
+      }
+      p.byGame.set(game, g);
+      p.byMode.set(mode, m);
+    }
+  }
+
+  const best = (map, key) => {
+    const rows2 = [...map.values()].filter((x) => x.played > 0);
+    if (!rows2.length) return null;
+    return rows2.map((x) => ({ ...x, rate: x.wins / x.played }))
+      .sort((a, b) => b.rate - a.rate || b.played - a.played || String(a[key]).localeCompare(String(b[key])))[0];
+  };
+  const worst = (map, key) => {
+    const rows2 = [...map.values()].filter((x) => x.played > 1);
+    if (!rows2.length) return null;
+    return rows2.map((x) => ({ ...x, rate: x.wins / x.played }))
+      .sort((a, b) => a.rate - b.rate || b.played - a.played || String(a[key]).localeCompare(String(b[key])))[0];
+  };
+  const topOf = (map) => {
+    const entries = [...map.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    return entries.length ? { name: entries[0][0], count: entries[0][1] } : null;
+  };
+
+  const out = [...table.values()].map((p) => {
+    const results = p.results.sort((a, b) => a.time - b.time);
+    return {
+      ...p,
+      winRate: p.appearances ? p.wins / p.appearances : 0,
+      rating: ratings[p.name] ?? ELO_START,
+      form: results.slice(-5).map((r) => r.won),
+      streak: currentStreak(results),
+      longestStreak: longestStreak(results),
+      bestGame: best(p.byGame, 'game'),
+      worstGame: worst(p.byGame, 'game'),
+      byGame: [...p.byGame.values()].sort((a, b) => b.wins - a.wins || b.played - a.played),
+      byMode: [...p.byMode.values()].sort((a, b) => b.wins - a.wins || b.played - a.played),
+      nemesis: topOf(p.lostTo),
+      favouriteVictim: topOf(p.beat),
+    };
+  });
+
+  const sorters = {
+    wins: (a, b) => b.wins - a.wins || b.winRate - a.winRate || a.name.localeCompare(b.name),
+    rate: (a, b) => b.winRate - a.winRate || b.wins - a.wins || a.name.localeCompare(b.name),
+    points: (a, b) => b.points - a.points || b.wins - a.wins || a.name.localeCompare(b.name),
+    rating: (a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name),
+  };
+  return out.sort(sorters[opts.sort] || sorters.wins);
+}
+
+function currentStreak(results) {
+  let wins = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (!results[i].won) break;
+    wins += 1;
+  }
+  if (wins) return { kind: 'wins', count: wins };
+  let since = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (results[i].won) break;
+    since += 1;
+  }
+  return { kind: 'drought', count: since };
+}
+
+function longestStreak(results) {
+  let best = 0, run = 0;
+  for (const r of results) {
+    run = r.won ? run + 1 : 0;
+    if (run > best) best = run;
+  }
+  return best;
+}
+
+/* -------------------------------------------------------------- seasons */
+function seasons(rows) {
+  const live = realRows(rows);
+  const years = [...new Set(live.map(seasonOf).filter((y) => y !== null))].sort((a, b) => b - a);
+  return years.map((year) => {
+    const table = leaderboard(live, { season: year, sort: 'points' });
+    const events = live.filter((r) => seasonOf(r) === year);
+    return {
+      year,
+      events: events.length,
+      table,
+      champion: table[0] || null,
+      games: [...new Set(events.map((r) => r.game || 'Untitled'))].sort(),
+    };
+  });
+}
+
+/* --------------------------------------------------------- head to head */
+/*
+ * Who has beaten whom in a final. Only the top two of an event are a real
+ * meeting — everyone else may never have played each other.
+ */
+function headToHead(rows) {
+  const names = new Set();
+  const pairs = new Map();
+  const key = (a, b) => `${a}\u0000${b}`;
+
+  for (const row of realRows(rows)) {
+    if (!row.winner || !row.runner_up) continue;
+    names.add(row.winner);
+    names.add(row.runner_up);
+    pairs.set(key(row.winner, row.runner_up), (pairs.get(key(row.winner, row.runner_up)) || 0) + 1);
+  }
+  const list = [...names].sort((a, b) => a.localeCompare(b));
+  return {
+    players: list,
+    wins: (a, b) => pairs.get(key(a, b)) || 0,
+    meetings: (a, b) => (pairs.get(key(a, b)) || 0) + (pairs.get(key(b, a)) || 0),
+  };
+}
+
+function rivalries(rows, { min = 2 } = {}) {
+  const h2h = headToHead(rows);
+  const out = [];
+  for (let i = 0; i < h2h.players.length; i++) {
+    for (let j = i + 1; j < h2h.players.length; j++) {
+      const a = h2h.players[i], b = h2h.players[j];
+      const meetings = h2h.meetings(a, b);
+      if (meetings < min) continue;
+      const aWins = h2h.wins(a, b), bWins = h2h.wins(b, a);
+      const leader = aWins === bWins ? null : aWins > bWins ? a : b;
+      out.push({ a, b, meetings, aWins, bWins, leader });
+    }
+  }
+  return out.sort((x, y) => y.meetings - x.meetings
+    || Math.abs(x.aWins - x.bWins) - Math.abs(y.aWins - y.bWins)
+    || x.a.localeCompare(y.a));
+}
+
+/* ---------------------------------------------------------- on this day */
+/*
+ * The same date in an earlier year. Anything from the last few days counts
+ * as "this week" so a board isn't blank for 364 days of the year.
+ */
+function onThisDay(rows, now = new Date(), { window = 3 } = {}) {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const out = [];
+  for (const row of realRows(rows)) {
+    const d = rowDate(row);
+    if (!d || d.getFullYear() >= today.getFullYear()) continue;
+    const anniversary = new Date(today.getFullYear(), d.getMonth(), d.getDate());
+    const days = Math.round((anniversary - today) / 86400000);
+    if (Math.abs(days) > window) continue;
+    out.push({ ...row, yearsAgo: today.getFullYear() - d.getFullYear(), daysOff: days });
+  }
+  return out.sort((a, b) => Math.abs(a.daysOff) - Math.abs(b.daysOff) || a.yearsAgo - b.yearsAgo);
+}
+
+/* -------------------------------------------------------------- formats */
+function byFormat(rows) {
+  const modes = new Map();
+  for (const row of realRows(rows)) {
+    const mode = row.mode || 'unknown';
+    const m = modes.get(mode) || { mode, events: 0, winners: new Map() };
+    m.events += 1;
+    m.winners.set(row.winner, (m.winners.get(row.winner) || 0) + 1);
+    modes.set(mode, m);
+  }
+  return [...modes.values()]
+    .map((m) => ({
+      mode: m.mode,
+      events: m.events,
+      winners: [...m.winners.entries()]
+        .map(([name, wins]) => ({ name, wins }))
+        .sort((a, b) => b.wins - a.wins || a.name.localeCompare(b.name)),
+    }))
+    .sort((a, b) => b.events - a.events || a.mode.localeCompare(b.mode));
+}
+
+/* ------------------------------------------------------------ overviews */
+function biggestWins(rows, { limit = 5 } = {}) {
+  return realRows(rows)
+    .map((r) => ({ ...r, field: Math.max(Number(r.player_count) || 0, participants(r).length) }))
+    .sort((a, b) => b.field - a.field || b.time - a.time)
+    .slice(0, limit);
+}
+
+/*
  * ha-bracket-card — a reusable game-night tournament card for Home Assistant.
  *
  * Frontend-only custom Lovelace card. All state lives in a single `input_text`
@@ -832,7 +1271,7 @@ function standingsSummary(result) {
  * the current champion, past winners and a leaderboard.
  */
 
-const CARD_VERSION = '1.6.2';
+const CARD_VERSION = '1.7.0';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.
@@ -1028,6 +1467,21 @@ function pickInBracket(players, opts, decisions, matchId, side) {
   return true;
 }
 
+/*
+ * Who finished where, best first — the one thing a season table can't be
+ * built without. A bracket ranks by how long you lasted; every other format
+ * already ends with a standings table. A tie broken by a decider puts the
+ * champion first regardless, because that is who actually won.
+ */
+function finishingOrder(res) {
+  const order = res.kind === 'bracket'
+    ? eliminationOrder(res.state)
+    : (res.standings || []).map((s) => s.name);
+  const champ = res.champion && res.champion.name;
+  if (!champ || order[0] === champ) return order;
+  return [champ, ...order.filter((name) => name !== champ)];
+}
+
 /* ---------- result tracking (InfluxDB via rest_command) ---------- */
 const TRACKING_DEFAULTS = {
   write_service: 'rest_command.game_night_write',
@@ -1049,7 +1503,7 @@ function trackingConfig(config) {
 const lpTag = (v) => String(v).replace(/[,= \\]/g, (c) => '\\' + c);
 const lpStr = (v) => '"' + String(v).replace(/[\\"]/g, (c) => '\\' + c) + '"';
 
-function resultLine(measurement, { game, mode, winner, runnerUp, players, created, standings, topWins, snapshot, sessions, games, temp }) {
+function resultLine(measurement, { game, mode, winner, runnerUp, players, created, standings, topWins, snapshot, sessions, games, temp, placings }) {
   const tags = `game=${lpTag(game || 'Untitled')},mode=${lpTag(MODES[mode].tag)}`;
   const fields = [
     `winner=${lpStr(winner)}`,
@@ -1058,6 +1512,8 @@ function resultLine(measurement, { game, mode, winner, runnerUp, players, create
     `player_count=${players.length}i`,
   ];
   if (standings) fields.push(`standings=${lpStr(standings)}`);
+  // The full finishing order, so a season table can award points by placing.
+  if (placings && placings.length) fields.push(`placings=${lpStr(placings.join(', '))}`);
   if (Number.isInteger(topWins)) fields.push(`top_wins=${topWins}i`);
   // King of the hill lineages carry enough to be picked up again later.
   // A one-off game is flagged and carries no snapshot, so it is never
@@ -1113,6 +1569,31 @@ function fmtDate(epochSec) {
 const modeLabelFromTag = (tag) => {
   for (const m of Object.values(MODES)) if (m.tag === tag) return m.label;
   return tag ? String(tag).replace(/_/g, ' ') : '';
+};
+
+const pct = (rate) => `${Math.round((rate || 0) * 100)}%`;
+
+// Five dots, newest last: a run of form you can read without counting.
+const formDots = (form) => (form || []).map((won) =>
+  `<span class="dot${won ? ' won' : ''}" title="${won ? 'won' : 'played'}"></span>`).join('')
+  || '<span class="muted tiny">—</span>';
+
+const streakLine = (p) => (p.streak.kind === 'wins'
+  ? `${p.streak.count} win${p.streak.count === 1 ? '' : 's'} in a row`
+  : p.streak.count
+    ? `${p.streak.count} event${p.streak.count === 1 ? '' : 's'} since a win`
+    : 'no results yet')
+  + (p.longestStreak > 1 ? ` · best run ${p.longestStreak}` : '');
+
+// Only the noteworthy ends of the scale earn a badge in the table.
+const streakBadge = (p) => {
+  if (p.streak.kind === 'wins' && p.streak.count >= 2) {
+    return ` <span class="badge hot" title="${p.streak.count} wins in a row">🔥${p.streak.count}</span>`;
+  }
+  if (p.streak.kind === 'drought' && p.streak.count >= 4) {
+    return ` <span class="badge cold" title="${p.streak.count} events since a win">${p.streak.count} dry</span>`;
+  }
+  return '';
 };
 
 function ordinal(n) {
@@ -1385,6 +1866,7 @@ class BracketCard extends HTMLElement {
       game: d.game, mode: d.mode, winner: champ.name, runnerUp: champ.runnerUp,
       players: d.players, created: d.created || Math.floor(Date.now() / 1000),
       standings: standingsSummary(res), topWins: koth ? res.kingWins : undefined,
+      placings: finishingOrder(res),
       snapshot: koth && !d.temp ? kothSnapshot(res) : null, sessions: res.sessions,
       games: res.totalGames, temp: koth && d.temp,
     });
@@ -2160,6 +2642,9 @@ class BracketHistoryCard extends HTMLElement {
     this._error = null;
     this._busy = false;
     this._filter = '';
+    this._view = 'champions';
+    this._sort = 'wins';
+    this._player = null;      // when set, the card shows that player's page
     this._lastRaw = undefined;
   }
 
@@ -2167,6 +2652,8 @@ class BracketHistoryCard extends HTMLElement {
     this._config = { limit: 100, ...config, tracking: config.tracking == null ? true : config.tracking };
     this._tracking = trackingConfig(this._config);
     if (this._config.game) this._filter = String(this._config.game);
+    if (this._config.view) this._view = String(this._config.view);
+    if (this._config.sort) this._sort = String(this._config.sort);
     this._rows = null;
     this._render();
   }
@@ -2190,7 +2677,7 @@ class BracketHistoryCard extends HTMLElement {
     this._busy = true; this._error = null;
     this._render();
     const limit = Math.max(1, Math.min(1000, Number(this._config.limit) || 100));
-    const q = `SELECT "winner", "runner_up", "players", "player_count", "standings", "top_wins", "games", "sessions", "last_played", "temp", "game", "mode" FROM "${this._tracking.measurement}" ORDER BY time DESC LIMIT ${limit}`;
+    const q = `SELECT "winner", "runner_up", "players", "player_count", "placings", "standings", "top_wins", "games", "sessions", "last_played", "temp", "game", "mode" FROM "${this._tracking.measurement}" ORDER BY time DESC LIMIT ${limit}`;
     try {
       const r = await callWithResponse(this._hass, this._tracking.query_service, { q });
       this._rows = parseInfluxRows(r && r.content != null ? r.content : r);
@@ -2218,74 +2705,322 @@ class BracketHistoryCard extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <ha-card>
         <div class="hdr">
-          <div class="title">${esc(title)}</div>
+          <div class="title">${esc(title)}${this._player ? `<span class="pill">${esc(this._player)}</span>` : ''}</div>
           <button class="ghost" id="refresh" ${this._busy ? 'disabled' : ''}>${this._busy ? 'Loading…' : 'Refresh'}</button>
         </div>
         ${body}
         <div class="foot">bracket-history-card v${CARD_VERSION}</div>
       </ha-card>
       <style>${STYLE}${HISTORY_STYLE}</style>`;
-    const refresh = this.shadowRoot.querySelector('#refresh');
+    const root = this.shadowRoot;
+    const refresh = root.querySelector('#refresh');
     if (refresh) refresh.onclick = () => this._load();
-    const sel = this.shadowRoot.querySelector('#filter');
+    const sel = root.querySelector('#filter');
     if (sel) sel.onchange = (e) => { this._filter = e.target.value; this._render(); };
+    const back = root.querySelector('#back');
+    if (back) back.onclick = () => { this._player = null; this._render(); };
+    root.querySelectorAll('[data-view]').forEach((el) => {
+      el.onclick = () => { this._view = el.getAttribute('data-view'); this._player = null; this._render(); };
+    });
+    root.querySelectorAll('[data-sort]').forEach((el) => {
+      el.onclick = () => { this._sort = el.getAttribute('data-sort'); this._render(); };
+    });
+    // Any name anywhere opens that player's page.
+    root.querySelectorAll('[data-player]').forEach((el) => {
+      el.onclick = () => { this._player = el.getAttribute('data-player'); this._render(); };
+    });
   }
 
+  /* ---- the views ---- */
+
   _historyView() {
-    const all = this._rows;
-    if (!all.length) return `<div class="pad muted">No results recorded yet. Finish a tournament with tracking on and it will show up here.</div>`;
-    const games = [...new Set(all.map((r) => r.game || 'Untitled'))].sort();
-    const rows = this._filter ? all.filter((r) => (r.game || 'Untitled') === this._filter) : all;
-    const latest = rows[0];
+    const rows = this._rows;
+    if (!rows.length) {
+      return `<div class="pad muted">No results recorded yet. Finish a tournament with tracking on and it will show up here.</div>`;
+    }
+    const scoped = this._filter
+      ? rows.filter((r) => (r.game || 'Untitled') === this._filter) : rows;
 
-    const wins = {};
-    for (const r of rows) wins[r.winner] = (wins[r.winner] || 0) + 1;
-    const board = Object.entries(wins).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-    // A one-off game doesn't hold a title, so it never fronts the banner.
-    const current = rows.find((r) => r.temp !== true) || latest;
+    if (this._player) return this._playerView(scoped);
+    const view = this._view || 'champions';
+    const body = view === 'league' ? this._leagueView(scoped)
+      : view === 'h2h' ? this._h2hView(scoped)
+      : view === 'history' ? this._resultsView(scoped)
+      : this._championsView(scoped);
+    return this._chrome(rows, view) + body;
+  }
 
-    const filter = games.length > 1 ? `
-      <select id="filter">
-        <option value="">All games</option>
-        ${games.map((g) => `<option value="${esc(g)}" ${g === this._filter ? 'selected' : ''}>${esc(g)}</option>`).join('')}
-      </select>` : '';
+  // Tabs and the game filter, shared by every view.
+  _chrome(rows, view) {
+    const games = [...new Set(rows.map((r) => r.game || 'Untitled'))].sort();
+    const tabs = [
+      ['champions', 'Champions'],
+      ['league', 'League'],
+      ['h2h', 'Head to head'],
+      ['history', 'History'],
+    ];
+    return `
+      <div class="pad bar">
+        <div class="tabs">${tabs.map(([id, label]) =>
+          `<button class="tab${id === view ? ' on' : ''}" data-view="${id}">${label}</button>`).join('')}</div>
+        ${games.length > 1 ? `
+          <select id="filter" title="Show one game only">
+            <option value="">All games</option>
+            ${games.map((g) => `<option value="${esc(g)}" ${g === this._filter ? 'selected' : ''}>${esc(g)}</option>`).join('')}
+          </select>` : ''}
+      </div>`;
+  }
 
+  /* ---- champions: belts, this season, the board ---- */
+  _championsView(rows) {
+    const held = belts(rows);
+    const board = leaderboard(rows, { sort: this._sort || 'wins' });
+    const years = seasons(rows);
+    const season = years[0];
+    const day = onThisDay(rows, new Date());
+
+    const beltRow = held.length ? `
+      <div class="pad">
+        <div class="sub">Title holders</div>
+        <div class="belts">${held.map((b) => `
+          <div class="belt">
+            <div class="belt-game">${esc(b.game)}</div>
+            <div class="belt-holder" data-player="${esc(b.holder)}">👑 ${esc(b.holder)}</div>
+            <div class="muted tiny">${b.defences
+              ? `${b.defences} defence${b.defences === 1 ? '' : 's'}`
+              : 'just won it'}${b.previous ? ` · took it from ${esc(b.previous)}` : ''}</div>
+            <div class="muted tiny">${esc(fmtDate(b.wonAt))}</div>
+          </div>`).join('')}</div>
+      </div>` : '';
+
+    const seasonBlock = season ? `
+      <div class="pad">
+        <div class="sub">${season.year} so far</div>
+        <div class="champ">🏆 ${season.year} leader:&nbsp;<strong>${esc(season.champion.name)}</strong>
+          <span class="tnote">${season.champion.points} pts · ${season.champion.wins} win${season.champion.wins === 1 ? '' : 's'} from ${season.champion.appearances} played · ${season.events} event${season.events === 1 ? '' : 's'}</span>
+        </div>
+      </div>` : '';
+
+    const sorts = [['wins', 'Wins'], ['rate', 'Win rate'], ['points', 'Points'], ['rating', 'Rating']];
+    const boardBlock = `
+      <div class="pad">
+        <div class="sub row-between">
+          <span>Leaderboard</span>
+          <span class="sorts">${sorts.map(([id, label]) =>
+            `<button class="chipbtn${(this._sort || 'wins') === id ? ' on' : ''}" data-sort="${id}">${label}</button>`).join('')}</span>
+        </div>
+        <table>
+          <tr class="th"><td></td><td>Player</td><td class="num">W</td><td class="num">2nd</td>
+              <td class="num">Played</td><td class="num">Rate</td><td class="num">Pts</td>
+              <td class="num">Rating</td><td>Form</td></tr>
+          ${board.map((p, i) => `
+            <tr>
+              <td class="rank">${i + 1}</td>
+              <td><button class="linkish" data-player="${esc(p.name)}">${esc(p.name)}</button>${streakBadge(p)}</td>
+              <td class="num"><strong>${p.wins}</strong></td>
+              <td class="num muted">${p.runnerUps}</td>
+              <td class="num muted">${p.appearances}</td>
+              <td class="num">${pct(p.winRate)}</td>
+              <td class="num">${p.points}</td>
+              <td class="num muted">${p.rating}</td>
+              <td class="nowrap">${formDots(p.form)}</td>
+            </tr>`).join('')}
+        </table>
+        <p class="muted tiny">Points: a placing in a field of n is worth n − place + 1. Rating starts at ${ELO_START} and moves with who you beat.</p>
+      </div>`;
+
+    const dayBlock = day.length ? `
+      <div class="pad">
+        <div class="sub">On this day</div>
+        ${day.slice(0, 3).map((r) => `
+          <div class="onthisday">${r.yearsAgo} year${r.yearsAgo === 1 ? '' : 's'} ago —
+            <strong>${esc(r.winner)}</strong> won ${esc(r.game || 'Untitled')}${r.runner_up ? `, beating ${esc(r.runner_up)}` : ''}.</div>`).join('')}
+      </div>` : '';
+
+    return beltRow + seasonBlock + boardBlock + dayBlock;
+  }
+
+  /* ---- league: season tables and formats ---- */
+  _leagueView(rows) {
+    const years = seasons(rows);
+    const formats = byFormat(rows);
+    const big = biggestWins(rows, { limit: 3 });
+
+    const seasonBlocks = years.map((season) => `
+      <div class="pad">
+        <div class="sub">${season.year} — ${season.events} event${season.events === 1 ? '' : 's'}, ${season.games.length} game${season.games.length === 1 ? '' : 's'}</div>
+        <table>
+          <tr class="th"><td></td><td>Player</td><td class="num">Pts</td><td class="num">W</td>
+              <td class="num">Played</td><td class="num">Rating</td></tr>
+          ${season.table.map((p, i) => `
+            <tr${i === 0 ? ' class="leader"' : ''}>
+              <td class="rank">${i + 1}</td>
+              <td><button class="linkish" data-player="${esc(p.name)}">${esc(p.name)}</button>${i === 0 ? ' 🏆' : ''}</td>
+              <td class="num"><strong>${p.points}</strong></td>
+              <td class="num">${p.wins}</td>
+              <td class="num muted">${p.appearances}</td>
+              <td class="num muted">${p.rating}</td>
+            </tr>`).join('')}
+        </table>
+      </div>`).join('');
+
+    const formatBlock = formats.length ? `
+      <div class="pad">
+        <div class="sub">By format</div>
+        <table>
+          <tr class="th"><td>Format</td><td class="num">Events</td><td>Winners</td></tr>
+          ${formats.map((f) => `
+            <tr>
+              <td>${esc(modeLabelFromTag(f.mode))}</td>
+              <td class="num muted">${f.events}</td>
+              <td>${f.winners.slice(0, 4).map((w) =>
+                `<span class="pillcount"><button class="linkish" data-player="${esc(w.name)}">${esc(w.name)}</button> ${w.wins}</span>`).join(' ')}</td>
+            </tr>`).join('')}
+        </table>
+      </div>` : '';
+
+    const bigBlock = big.length ? `
+      <div class="pad">
+        <div class="sub">Biggest fields</div>
+        ${big.map((r) => `<div class="onthisday"><strong>${esc(r.winner)}</strong> beat ${r.field - 1} others at ${esc(r.game || 'Untitled')} — ${esc(fmtDate(r.time))}</div>`).join('')}
+      </div>` : '';
+
+    return seasonBlocks + formatBlock + bigBlock;
+  }
+
+  /* ---- head to head ---- */
+  _h2hView(rows) {
+    const h = headToHead(rows);
+    const rivals = rivalries(rows, { min: 1 });
+    if (!h.players.length) {
+      return `<div class="pad muted">No finals with a named runner-up yet — this fills in as tournaments finish.</div>`;
+    }
+    const grid = `
+      <div class="pad">
+        <div class="sub">Finals won against</div>
+        <div class="scroll tight">
+          <table class="matrix">
+            <tr class="th"><td></td>${h.players.map((p) => `<td class="num">${esc(p)}</td>`).join('')}</tr>
+            ${h.players.map((a) => `
+              <tr><td class="nowrap"><button class="linkish" data-player="${esc(a)}">${esc(a)}</button></td>
+                ${h.players.map((b) => {
+                  if (a === b) return `<td class="num self">—</td>`;
+                  const w = h.wins(a, b), l = h.wins(b, a);
+                  if (!w && !l) return `<td class="num muted">·</td>`;
+                  return `<td class="num ${w > l ? 'ahead' : w < l ? 'behind' : ''}">${w}–${l}</td>`;
+                }).join('')}
+              </tr>`).join('')}
+          </table>
+        </div>
+        <p class="muted tiny">Read across: how often that player has beaten each other player in a final.</p>
+      </div>`;
+
+    const rivalBlock = rivals.length ? `
+      <div class="pad">
+        <div class="sub">Rivalries</div>
+        <table>
+          ${rivals.slice(0, 8).map((r) => `
+            <tr>
+              <td class="nowrap"><button class="linkish" data-player="${esc(r.a)}">${esc(r.a)}</button>
+                <span class="muted">v</span>
+                <button class="linkish" data-player="${esc(r.b)}">${esc(r.b)}</button></td>
+              <td class="num"><strong>${r.aWins}–${r.bWins}</strong></td>
+              <td class="muted">${r.leader ? `${esc(r.leader)} leads` : 'all square'} · ${r.meetings} final${r.meetings === 1 ? '' : 's'}</td>
+            </tr>`).join('')}
+        </table>
+      </div>` : '';
+
+    return grid + rivalBlock;
+  }
+
+  /* ---- the plain results list ---- */
+  _resultsView(rows) {
     const detail = (r) => {
       if (r.mode === 'king_of_the_hill') {
         const bits = [];
         if (Number.isFinite(r.top_wins)) bits.push(`${r.top_wins} wins on top`);
         if (Number.isFinite(r.games)) bits.push(`${r.games} games`);
         if (Number.isFinite(r.sessions) && r.sessions > 1) bits.push(`${r.sessions} sessions`);
-        if (Number.isFinite(r.last_played) && r.last_played - r.time > 86400) bits.push(`last played ${fmtDate(r.last_played)}`);
         return `<span class="muted"> — 👑 ${bits.join(' · ') || 'king of the hill'}</span>`;
       }
       return r.runner_up ? `<span class="muted"> beat ${esc(r.runner_up)}</span>` : '';
     };
-    const champ = current ? `
-      <div class="champ">🏆 Current champion:&nbsp;<strong>${esc(current.winner)}</strong>
-        <span class="tnote">${esc(current.game || 'Untitled')}${current.mode ? ` · ${esc(modeLabelFromTag(current.mode))}` : ''} · ${esc(fmtDate(current.last_played || current.time))}</span>
-      </div>` : `<div class="pad muted">No results for this game yet.</div>`;
+    return `
+      <div class="pad">
+        <table>
+          ${rows.map((r) => `
+            <tr>
+              <td class="muted nowrap">${esc(fmtDate(r.time))}</td>
+              <td>${esc(r.game || 'Untitled')}
+                <div class="muted tiny">${esc(modeLabelFromTag(r.mode))}${r.temp === true ? ' <span class="tag">one-off</span>' : ''}</div></td>
+              <td><button class="linkish"><strong data-player="${esc(r.winner)}">${esc(r.winner)}</strong></button>${detail(r)}
+                ${r.placings ? `<div class="muted tiny">${esc(r.placings)}</div>`
+                  : r.players ? `<div class="muted tiny">Players: ${esc(r.players)}</div>` : ''}
+                ${r.standings ? `<div class="muted tiny">${esc(r.standings)}</div>` : ''}</td>
+            </tr>`).join('')}
+        </table>
+      </div>`;
+  }
+
+  /* ---- one player ---- */
+  _playerView(rows) {
+    const name = this._player;
+    const board = leaderboard(rows);
+    const p = board.find((x) => x.name === name);
+    if (!p) {
+      return `<div class="pad"><button class="ghost" id="back">← Back</button>
+        <p class="muted">Nothing recorded for ${esc(name)}.</p></div>`;
+    }
+    const held = belts(rows).filter((b) => b.holder === name);
+    const recent = p.results.slice().reverse().slice(0, 8);
+    const stat = (label, value, note = '') =>
+      `<div class="stat"><div class="stat-v">${value}</div><div class="stat-l">${label}</div>${note ? `<div class="muted tiny">${note}</div>` : ''}</div>`;
 
     return `
-      <div class="pad top">${filter}</div>
-      ${champ}
+      <div class="pad bar">
+        <button class="ghost" id="back">← Back</button>
+        <div class="who">${esc(name)}${held.length ? ` <span class="muted">— holds ${held.map((b) => esc(b.game)).join(', ')}</span>` : ''}</div>
+      </div>
+      <div class="pad stats">
+        ${stat('Wins', p.wins, `from ${p.appearances} played`)}
+        ${stat('Win rate', pct(p.winRate))}
+        ${stat('Points', p.points)}
+        ${stat('Rating', p.rating)}
+        ${stat('Runner-up', p.runnerUps)}
+        ${stat('Best field', p.bestField || '—', p.bestField ? `${p.bestField} players` : '')}
+      </div>
+      <div class="pad">
+        <div class="sub">Form</div>
+        <div>${formDots(p.form)} <span class="muted tiny">${streakLine(p)}</span></div>
+      </div>
       <div class="pad grid">
         <div>
-          <div class="sub">Leaderboard</div>
+          <div class="sub">By game</div>
           <table>
-            ${board.map(([n, c], i) => `<tr><td class="rank">${i + 1}</td><td>${esc(n)}</td><td class="num">${c} win${c === 1 ? '' : 's'}</td></tr>`).join('')}
+            ${p.byGame.map((g) => `<tr><td>${esc(g.game)}</td><td class="num">${g.wins}/${g.played}</td>
+              <td class="num muted">${pct(g.played ? g.wins / g.played : 0)}</td></tr>`).join('')}
           </table>
+          ${p.bestGame ? `<p class="muted tiny">Best at ${esc(p.bestGame.game)}${p.worstGame && p.worstGame.game !== p.bestGame.game ? `, worst at ${esc(p.worstGame.game)}` : ''}.</p>` : ''}
         </div>
         <div>
-          <div class="sub">Results</div>
+          <div class="sub">By format</div>
           <table>
-            ${rows.map((r) => `<tr><td class="muted nowrap">${esc(fmtDate(r.time))}</td>
-              <td>${esc(r.game || 'Untitled')}${r.mode ? `<div class="muted tiny">${esc(modeLabelFromTag(r.mode))}${r.temp === true ? ' <span class="tag">one-off</span>' : ''}</div>` : ''}</td>
-              <td><strong>${esc(r.winner)}</strong>${detail(r)}
-                  ${r.players ? `<div class="muted tiny">Players: ${esc(r.players)}</div>` : ''}
-                  ${r.standings ? `<div class="muted tiny">${esc(r.standings)}</div>` : ''}</td></tr>`).join('')}
+            ${p.byMode.map((m) => `<tr><td>${esc(modeLabelFromTag(m.mode))}</td><td class="num">${m.wins}/${m.played}</td>
+              <td class="num muted">${pct(m.played ? m.wins / m.played : 0)}</td></tr>`).join('')}
           </table>
+          ${p.nemesis ? `<p class="muted tiny">Beaten most often by <button class="linkish" data-player="${esc(p.nemesis.name)}">${esc(p.nemesis.name)}</button> (${p.nemesis.count}).</p>` : ''}
+          ${p.favouriteVictim ? `<p class="muted tiny">Beats <button class="linkish" data-player="${esc(p.favouriteVictim.name)}">${esc(p.favouriteVictim.name)}</button> most (${p.favouriteVictim.count}).</p>` : ''}
         </div>
+      </div>
+      <div class="pad">
+        <div class="sub">Recent results</div>
+        <table>
+          ${recent.map((r) => `<tr>
+            <td class="muted nowrap">${esc(fmtDate(r.time))}</td>
+            <td>${esc(r.game || 'Untitled')}</td>
+            <td class="num">${r.won ? '🏆 1st' : ordinal(r.rank)}</td>
+            <td class="num muted">of ${r.field}</td></tr>`).join('')}
+        </table>
       </div>`;
   }
 }
@@ -2296,6 +3031,54 @@ const HISTORY_STYLE = `
   select { width:auto; padding: 6px 10px; }
   .tag { display:inline-block; padding: 0 6px; border-radius: 999px; font-size:.7rem;
          background: var(--secondary-background-color); color: var(--secondary-text-color); }
+  .bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding-bottom: 0; }
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; }
+  .tab { font: inherit; font-size:.85rem; cursor:pointer; padding: 6px 12px; border-radius: 999px;
+         border: 1px solid var(--divider-color, #e0e0e0); background: transparent;
+         color: var(--primary-text-color); }
+  .tab.on { background: var(--primary-color); color: var(--text-primary-color, #fff); border-color: transparent; }
+  .chipbtn { font: inherit; font-size:.72rem; cursor:pointer; padding: 3px 9px; border-radius: 999px;
+             border: 1px solid var(--divider-color, #e0e0e0); background: transparent;
+             color: var(--secondary-text-color); margin-left: 4px; }
+  .chipbtn.on { background: var(--secondary-background-color); color: var(--primary-text-color); }
+  .sorts { display:inline-flex; flex-wrap:wrap; }
+  .row-between { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .linkish { font: inherit; background:none; border:none; padding:0; cursor:pointer;
+             color: var(--primary-color); text-align:left; }
+  .linkish:hover { text-decoration: underline; }
+  .who { font-size: 1.05rem; font-weight: 600; }
+  /* belts */
+  .belts { display:flex; gap:10px; flex-wrap:wrap; }
+  .belt { flex: 1 1 150px; min-width: 150px; padding: 10px 12px; border-radius: 10px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          background: var(--secondary-background-color); }
+  .belt-game { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em;
+               color: var(--secondary-text-color); font-weight:700; }
+  .belt-holder { font-size: 1.05rem; font-weight: 700; margin: 2px 0 4px; cursor:pointer;
+                 color: var(--primary-text-color); }
+  /* form dots */
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:3px;
+         background: var(--divider-color, #ccc); }
+  .dot.won { background: var(--primary-color); }
+  .badge.hot { background: var(--warning-color, #ffa600); color:#222; }
+  .badge.cold { background: var(--secondary-background-color); color: var(--secondary-text-color); }
+  .badge { display:inline-block; padding: 0 6px; border-radius: 999px; font-size:.7rem; font-weight:700; }
+  /* stats strip on a player page */
+  .stats { display:grid; gap:10px; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); }
+  .stat { padding: 8px 10px; border-radius: 10px;
+          background: var(--secondary-background-color); }
+  .stat-v { font-size: 1.25rem; font-weight: 700; }
+  .stat-l { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em;
+            color: var(--secondary-text-color); }
+  /* head-to-head grid */
+  .matrix td { text-align:center; padding: 5px 8px; white-space:nowrap; }
+  .matrix td:first-child { text-align:left; }
+  .matrix .self { color: var(--disabled-text-color, #9e9e9e); }
+  .matrix .ahead { color: var(--success-color, #43a047); font-weight:700; }
+  .matrix .behind { color: var(--error-color, #db4437); }
+  .onthisday { font-size:.92rem; padding: 3px 0; }
+  .pillcount { display:inline-block; margin-right: 8px; white-space:nowrap; }
+  tr.leader td { background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
 `;
 
 if (!customElements.get('bracket-card')) {

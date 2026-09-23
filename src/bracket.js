@@ -416,3 +416,42 @@ export function slotLabel(ref) {
   if (ref.type === 'bye') return 'BYE';
   return '';
 }
+
+/*
+ * Finishing order, best first.
+ *
+ * Placing in a bracket is "how long you lasted": whoever is eliminated last
+ * finishes highest. `state.order` is topological — winners bracket, then
+ * losers bracket, then the grand final — so walking it backwards visits
+ * eliminations from last to first.
+ *
+ * In double elimination a loss in the winners bracket isn't an elimination
+ * (you drop into the losers bracket), so only losers-bracket and grand-final
+ * losses count. The champion is excluded, which also disposes of the grand
+ * final's first game: when a reset is played its loser is the champion, and
+ * the real runner-up falls out of the reset game instead.
+ *
+ * Players still alive (an unfinished tournament) come last, in seed order.
+ */
+export function eliminationOrder(state) {
+  const champ = champion(state);
+  const order = [];
+  const seen = new Set();
+  if (champ) { order.push(champ.name); seen.add(champ.name); }
+
+  for (let i = state.order.length - 1; i >= 0; i--) {
+    const match = state.matches[state.order[i]];
+    if (!match.winner || match.winner === 'bye') continue;
+    // A winners-bracket loss only eliminates when there's nowhere to drop to.
+    if (match.bracket === 'W' && !state.single && state.matches['GF-1']) continue;
+    const loser = match.winner === 'p1' ? match.p2 : match.p1;
+    if (!isPlayer(loser) || seen.has(loser.name)) continue;
+    seen.add(loser.name);
+    order.push(loser.name);
+  }
+
+  for (const name of state.players) {
+    if (!seen.has(name)) { seen.add(name); order.push(name); }
+  }
+  return order;
+}
