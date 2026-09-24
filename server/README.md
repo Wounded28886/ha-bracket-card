@@ -108,6 +108,20 @@ If you would rather it ran as an existing account instead of re-owning the
 folder, set `PUID` and `PGID` to that account's ids and make sure it can
 write there.
 
+Some hosts don't allow a container to take ownership at all — user-namespace
+remapping, or a filesystem that refuses `chown`. Rather than refuse to start,
+the container then keeps running as root and says so in its log. If you'd
+rather it didn't, give the folder to a user on the host and set `PUID`/`PGID`
+to match.
+
+The first two lines of the log say which version is running and which user it
+ended up as, which is the quickest way to check what you've actually got:
+
+```
+bracket-board v1.7.2 — running as uid 1000
+listening on http://0.0.0.0:8099 — data in /data/store.json
+```
+
 ## Using it
 
 Every device pointed at the URL stays in step: a tap on one phone shows up on

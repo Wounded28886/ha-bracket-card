@@ -17,6 +17,7 @@
  */
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './lib/store.mjs';
@@ -28,6 +29,17 @@ const TITLE = process.env.TITLE || 'Game Night';
 const BOARD = process.env.BOARD || 'default';
 const POLL_MS = Number(process.env.POLL_MS || 25000);
 const MAX_BODY = 1024 * 1024;
+
+// Read from the bundled card so there is one version to keep in step.
+const VERSION = (() => {
+  for (const file of [join(HERE, 'public', 'board.js'), join(HERE, '..', 'dist', 'ha-bracket-card.js')]) {
+    try {
+      const m = readFileSync(file, 'utf8').match(/CARD_VERSION = '([^']+)'/);
+      if (m) return `v${m[1]}`;
+    } catch (e) { /* try the next one */ }
+  }
+  return '(unknown version)';
+})();
 
 const store = new Store(DATA_DIR);
 
@@ -162,7 +174,10 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   const { port } = server.address();
-  console.log(`bracket server listening on http://0.0.0.0:${port} — data in ${store.stats().file}`);
+  // The version and the user are the first two questions when something is
+  // wrong in someone else's logs, so lead with them.
+  console.log(`bracket-board ${VERSION} — running as uid ${process.getuid ? process.getuid() : 'n/a'}`);
+  console.log(`listening on http://0.0.0.0:${port} — data in ${store.stats().file}`);
 });
 
 // Never leave a game night on the floor.
