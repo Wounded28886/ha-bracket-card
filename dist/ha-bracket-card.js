@@ -1271,7 +1271,7 @@ function biggestWins(rows, { limit = 5 } = {}) {
  * the current champion, past winners and a leaderboard.
  */
 
-const CARD_VERSION = '1.7.0';
+const CARD_VERSION = '1.7.1';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.

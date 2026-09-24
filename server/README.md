@@ -95,6 +95,18 @@ All optional, set as environment variables:
 | `TITLE` | `Game Night` | Heading on the page |
 | `BOARD` | `default` | Board used when the URL doesn't name one |
 | `POLL_MS` | `25000` | How long a sync request may wait before answering |
+| `PUID` / `PGID` | `1000` | Run the server as this user instead. See below. |
+
+### Permissions on the data folder
+
+The server runs unprivileged. A folder you bind-mount belongs to whoever
+created it on the host — on a NAS that is usually root — so the container
+starts as root just long enough to hand that folder to its own user, then
+drops root for good.
+
+If you would rather it ran as an existing account instead of re-owning the
+folder, set `PUID` and `PGID` to that account's ids and make sure it can
+write there.
 
 ## Using it
 
