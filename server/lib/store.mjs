@@ -20,6 +20,7 @@ export class Store {
     this.flushMs = flushMs;
     this.timer = null;
     this.waiters = new Map();     // board -> Set of resolve callbacks
+    this.writeError = null;       // set while the store can't be written
     this.data = this.#load();
   }
 
@@ -48,10 +49,34 @@ export class Store {
     if (this.timer.unref) this.timer.unref();
   }
 
+  /*
+   * Write the store out. A failure here used to be thrown from a timer,
+   * which killed the process minutes after start-up with a stack trace and
+   * no hint of the cause — the common one being a data folder the container
+   * can't write to. Now it is recorded and reported instead: the server
+   * stays up, /healthz turns unhealthy, and saving tells the person why.
+   */
   flush() {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    writeFileSync(this.tmp, JSON.stringify(this.data));
-    renameSync(this.tmp, this.file);
+    try {
+      writeFileSync(this.tmp, JSON.stringify(this.data));
+      renameSync(this.tmp, this.file);
+      if (this.writeError) {
+        console.log(`[store] writing to ${this.file} works again`);
+        this.writeError = null;
+      }
+      return true;
+    } catch (err) {
+      const message = err && err.code === 'EACCES'
+        ? `cannot write to ${this.dir} — the container has no permission to write there. `
+          + 'Give the folder to the user the server runs as, or set PUID/PGID to a user that owns it.'
+        : `cannot write to ${this.file}: ${err.message}`;
+      // Only shout when the state changes, so a broken mount doesn't fill
+      // the log with the same line every few seconds.
+      if (this.writeError !== message) console.error(`[store] ${message}`);
+      this.writeError = message;
+      return false;
+    }
   }
 
   /* ---- board state (what the card reads and writes) ---- */
@@ -119,6 +144,13 @@ export class Store {
       boards: Object.keys(this.data.boards).length,
       points: this.data.points.length,
       file: this.file,
+      ...(this.writeError ? { error: this.writeError } : {}),
     };
+  }
+
+  /* Can the store actually be written? Checked once at start-up so a
+     permission problem is reported immediately, not on the first save. */
+  checkWritable() {
+    return this.flush();
   }
 }

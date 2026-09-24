@@ -143,6 +143,32 @@ section('store');
   ok((await s2.watch('default', 999, 2000)).rev === 1, 'a stale rev returns immediately');
 }
 
+// ---- a data folder that can't be written ----
+section('unwritable data folder');
+{
+  // Simulate the container having no permission to write: point the store at
+  // a path it can't create a file in. A failed write used to be thrown from a
+  // timer and killed the process; it must be reported instead.
+  const dir = tmp();
+  const s = new Store(dir, { flushMs: 5 });
+  s.setBoard('default', 'before');
+  ok(s.flush() === true, 'a healthy store flushes');
+
+  const readOnly = new Store(dir, { flushMs: 5 });
+  // Force the failure the way the NAS does, without needing real permissions.
+  readOnly.file = join(dir, 'nope', 'store.json');
+  readOnly.tmp = join(dir, 'nope', 'store.json.tmp');
+  readOnly.dir = join(dir, 'nope');
+
+  let threw = false;
+  try { readOnly.setBoard('default', 'after'); readOnly.flush(); } catch (e) { threw = true; }
+  ok(!threw, 'a failed write does not throw');
+  ok(!!readOnly.writeError, `the failure is recorded (${readOnly.writeError})`);
+  ok(readOnly.stats().error, 'and surfaces in stats, so /healthz can report it');
+  ok(readOnly.checkWritable() === false, 'checkWritable says so at start-up');
+  ok(s.checkWritable() === true, 'and is true for a healthy store');
+}
+
 // ---- HTTP API ----
 section('http api');
 {

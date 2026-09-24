@@ -107,7 +107,10 @@ const server = createServer(async (req, res) => {
   const board = url.searchParams.get('board') || BOARD;
 
   try {
-    if (path === '/healthz') return json(res, 200, { ok: true, ...store.stats() });
+    if (path === '/healthz') {
+      const stats = store.stats();
+      return json(res, stats.error ? 503 : 200, { ok: !stats.error, ...stats });
+    }
 
     if (path === '/api/config') {
       return json(res, 200, { title: TITLE, board, poll_ms: POLL_MS, version: 1 });
@@ -125,6 +128,9 @@ const server = createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)) || '{}');
       if (typeof body.value !== 'string') return json(res, 400, { error: 'value must be a string' });
       const next = store.setBoard(body.board || board, body.value);
+      // The write is queued, so report a known-broken store rather than
+      // letting the page believe it saved.
+      if (store.writeError) return json(res, 500, { error: store.writeError });
       return json(res, 200, { board: body.board || board, rev: next.rev });
     }
 
@@ -135,6 +141,7 @@ const server = createServer(async (req, res) => {
         ? (JSON.parse(raw || '{}').line || '') : raw;
       try {
         const n = store.write(line);
+        if (store.writeError) return json(res, 500, { error: store.writeError });
         return json(res, 200, { written: n });
       } catch (e) {
         return json(res, 400, { error: e.message });
@@ -178,6 +185,11 @@ server.listen(PORT, () => {
   // wrong in someone else's logs, so lead with them.
   console.log(`bracket-board ${VERSION} — running as uid ${process.getuid ? process.getuid() : 'n/a'}`);
   console.log(`listening on http://0.0.0.0:${port} — data in ${store.stats().file}`);
+  // Say straight away whether the data folder works, rather than looking
+  // healthy until the first save.
+  if (!store.checkWritable()) {
+    console.error('[store] the board will not be able to save anything until that is fixed');
+  }
 });
 
 // Never leave a game night on the floor.

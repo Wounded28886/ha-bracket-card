@@ -44,7 +44,7 @@ import {
   biggestWins, ELO_START,
 } from './stats.js';
 
-const CARD_VERSION = '1.7.2';
+const CARD_VERSION = '1.7.3';
 
 /* ---------- formats ---------- */
 // Mode is stored as a single character in the helper.
